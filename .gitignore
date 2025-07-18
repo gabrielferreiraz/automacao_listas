@@ -1,0 +1,21 @@
+# Ambiente Virtual
+.venv/
+venv/
+
+# Arquivos de Cache do Python
+__pycache__/
+*.pyc
+
+# Arquivos de ambiente (contém segredos)
+.env
+
+# Arquivos temporários de upload
+temp_uploaded.csv
+temp_uploaded.xlsx
+
+# Pastas de output (geralmente não são versionadas)
+/Relatorios/
+/pessoas_geradas/
+
+# Arquivos de sistema
+.DS_Store
