@@ -1,4 +1,6 @@
 import streamlit as st
+import json
+from streamlit_option_menu import option_menu
 import pandas as pd
 import os
 from datetime import datetime, date, timedelta
@@ -8,195 +10,259 @@ from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 import warnings
 import numpy as np
 import glob
+import difflib
 
 warnings.filterwarnings("ignore", category=UserWarning, module='openpyxl')
 
-from data_ingestion import load_data
-from data_cleaning import clean_and_filter_data, ASSERTIVA_ESSENTIAL_COLS, LEMIT_ESSENTIAL_COLS
+import logging
+
+# Ensure logs directory exists before configuring logging
+try:
+    os.makedirs('logs', exist_ok=True)
+except Exception:
+    pass
+
+# Logging setup (logs/app.log)
+logging.basicConfig(
+    filename=os.path.join('logs', 'app.log'),
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+# --- Persistência dinâmica de consultores e equipes ---
+CONSULTORES_FILE = "consultores.json"
+EQUIPES_FILE = "equipes.json"
+
+def carregar_consultores():
+    try:
+        with open(CONSULTORES_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+def salvar_consultores(consultores):
+    with open(CONSULTORES_FILE, "w", encoding="utf-8") as f:
+        json.dump(consultores, f, ensure_ascii=False, indent=2)
+
+def carregar_equipes():
+    try:
+        with open(EQUIPES_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)["equipes"]
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        return []
+
+def salvar_equipes(equipes):
+    with open(EQUIPES_FILE, "w", encoding="utf-8") as f:
+        json.dump({"equipes": equipes}, f, ensure_ascii=False, indent=2)
+
+from data_ingestion import load_data, ASSERTIVA_ESSENTIAL_COLS, LEMIT_ESSENTIAL_COLS
+from data_cleaning import clean_and_filter_data
 from create_pdf import create_pdf_robust
 
 # --- Configurações e Lógica para o Divisor de Listas ---
-from config import CONSULTORES, EQUIPES, CONSULTOR_PARA_EQUIPE
 
 # Cores para o Excel (RGB para OpenPyXL)
 COLOR_LIGHT_BLUE = "E0EBFB"
 COLOR_WHITE = "FFFFFF"
 
-def clean_phone_number(number_str):
-    """Limpa e valida um número de telefone, retornando NaN se inválido."""
-    if pd.isna(number_str) or number_str == '':
-        return np.nan
-    cleaned = ''.join(filter(str.isdigit, str(number_str)))
-    if len(cleaned) < 8:
-        return np.nan
-    return cleaned
+from utils import (
+    clean_phone_number,
+    normalize_cep,
+    best_match_column,
+    proximo_dia_util,
+    determine_localidade,
+    gerar_excel_em_memoria,
+)
 
-def proximo_dia_util(data_atual):
-    proximo_dia = data_atual + timedelta(days=1)
-    while proximo_dia.weekday() >= 5:
-        proximo_dia += timedelta(days=1)
-    return proximo_dia
 
-def formatar_planilha(writer, df):
-    workbook = writer.book
-    worksheet = writer.sheets['Leads']
-    thin_border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
-    center_align = Alignment(horizontal='center', vertical='center')
-    cols_to_center = ["1º Contato", "2º Contato", "3º Contato", "Atend. Lig.(S/N)", "Visita Marc.(S/N)"]
+def normalize_cep(cep_str):
+    """Normaliza um CEP: remove não dígitos e retorna string com 8 dígitos ou empty string."""
+    if pd.isna(cep_str) or str(cep_str).strip() == '':
+        return ""
+    digits = ''.join(filter(str.isdigit, str(cep_str)))
+    if len(digits) == 8:
+        # Retorna apenas os 8 dígitos (sem traço)
+        return digits
+    elif len(digits) > 8:
+        # Se tiver mais dígitos, pega os 8 últimos (possível prefixo extra)
+        d = digits[-8:]
+        return d
+    else:
+        # Retorna vazio para CEPs inválidos/curtos
+        return ""
 
-    for col_idx, column_name in enumerate(df.columns, 1):
-        cell = worksheet.cell(row=2, column=col_idx)
-        cell.border = thin_border
-        cell.fill = PatternFill(start_color=COLOR_LIGHT_BLUE, end_color=COLOR_LIGHT_BLUE, fill_type="solid")
-        cell.font = Font(bold=True)
-        if column_name in cols_to_center:
-            cell.alignment = center_align
 
-    for row_idx in range(3, len(df) + 3):
-        fill_color = COLOR_LIGHT_BLUE if (row_idx - 3) % 2 == 0 else COLOR_WHITE
-        for col_idx, column_name in enumerate(df.columns, 1):
-            cell = worksheet.cell(row=row_idx, column=col_idx)
-            cell.border = thin_border
-            cell.fill = PatternFill(start_color=fill_color, end_color=fill_color, fill_type="solid")
-            if column_name in cols_to_center:
-                cell.alignment = center_align
+def best_match_column(df_columns, candidates, min_score=50):
+    """Retorna a melhor coluna de `df_columns` que corresponde aos `candidates`.
+    Usa várias heurísticas combinadas (igualdade, substring, interseção de tokens e similaridade).
+    Retorna string vazia se nenhuma coluna atingir `min_score`.
+    """
+    if not df_columns:
+        return ''
 
-    for col_idx, column_name in enumerate(df.columns, 1):
-        max_length = 0
-        header_cell = worksheet.cell(row=2, column=col_idx)
-        if header_cell.value:
-            max_length = len(str(header_cell.value))
-        for row_idx in range(3, len(df) + 3):
-            cell = worksheet.cell(row=row_idx, column=col_idx)
+    df_cols = [str(c) for c in df_columns]
+    df_cols_lower = [c.lower() for c in df_cols]
+
+    best_col = ''
+    best_score = 0.0
+
+    for cand in candidates:
+        if not cand:
+            continue
+        cand_l = str(cand).lower()
+        cand_tokens = set([t for t in ''.join(ch if ch.isalnum() else ' ' for ch in cand_l).split() if t])
+
+        for i, col in enumerate(df_cols):
+            col_l = df_cols_lower[i]
+            score = 0.0
+
+            # Exata igualdade (maior peso)
+            if col_l == cand_l:
+                score += 120
+
+            # Substring (col contém candidato ou candidato contém coluna)
+            if cand_l in col_l or col_l in cand_l:
+                score += 80
+
+            # Token overlap
+            col_tokens = set([t for t in ''.join(ch if ch.isalnum() else ' ' for ch in col_l).split() if t])
+            if cand_tokens and col_tokens:
+                inter = cand_tokens.intersection(col_tokens)
+                union = cand_tokens.union(col_tokens)
+                if union:
+                    score += 40 * (len(inter) / len(union))
+
+            # Similaridade fuzzier via SequenceMatcher
             try:
-                if len(str(cell.value)) > max_length:
-                    max_length = len(str(cell.value))
-            except:
+                ratio = difflib.SequenceMatcher(a=cand_l, b=col_l).ratio()
+                score += 40 * ratio
+            except Exception:
                 pass
-        adjusted_width = (max_length + 2) * 1.2
-        worksheet.column_dimensions[header_cell.column_letter].width = adjusted_width
+
+            # Slight preference for shorter column names on ties
+            score -= 0.01 * len(col_l)
+
+            if score > best_score:
+                best_score = score
+                best_col = col
+
+    if best_score >= min_score:
+        return best_col
+    return ''
+
+
+def proximo_dia_util(data_obj):
+    """Retorna o próximo dia útil (pulando sábados e domingos)."""
+    try:
+        next_day = data_obj + timedelta(days=1)
+        while next_day.weekday() >= 5:  # 5 = Saturday, 6 = Sunday
+            next_day += timedelta(days=1)
+        return next_day
+    except Exception:
+        # Se qualquer erro ocorrer (ex: data_obj não é date), tente converter
+        try:
+            next_day = (pd.to_datetime(data_obj) + pd.Timedelta(days=1)).date()
+            while next_day.weekday() >= 5:
+                next_day = (pd.to_datetime(next_day) + pd.Timedelta(days=1)).date()
+            return next_day
+        except Exception:
+            return data_obj
+
+
+def determine_localidade(user_col_mapping, df_lote, default="CG"):
+    """Determina uma string de localidade segura para uso em nomes de arquivos.
+
+    Regras:
+    - Prefere coluna 'UF' quando mapeada e a célula parece ser a sigla (2 letras).
+    - Caso contrário, usa 'Cidade' apenas se for muito curta (<=3 chars).
+    - Caso contrário, retorna `default`.
+    """
+    # Tenta várias chaves comuns para UF
+    possible_uf_keys = ["UF", "Estado", "Estado/UF", "UF/Estado"]
+    for k in possible_uf_keys:
+        uf_col = user_col_mapping.get(k)
+        if uf_col and uf_col in df_lote.columns and not df_lote[uf_col].dropna().empty:
+            val = str(df_lote[uf_col].iloc[0]).strip()
+            if len(val) == 2:
+                return val.upper()
+
+    # Se não houver UF válido, verificar Cidade mas somente se curta (evita nomes longos como 'DOURADOS')
+    cidade_col = user_col_mapping.get("Cidade")
+    if cidade_col and cidade_col in df_lote.columns and not df_lote[cidade_col].dropna().empty:
+        val = str(df_lote[cidade_col].iloc[0]).strip()
+        if 0 < len(val) <= 3:
+            return val.upper()
+
+    return default
+
 
 def gerar_excel_em_memoria(df_lote, consultor, data):
+    """Gera um buffer Excel em memória para um DataFrame (usado por divisor de listas)."""
     output = io.BytesIO()
-    primeiro_nome = consultor.split(' ')[0]
-    data_formatada_cabecalho = data.strftime('%d/%m')
-    cabecalho_texto = f"Leads Automoveis - {primeiro_nome} {data_formatada_cabecalho}"
+    try:
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df_lote.to_excel(writer, index=False)
+        output.seek(0)
+        return output
+    except Exception:
+        return io.BytesIO()
 
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df_lote.to_excel(writer, index=False, startrow=1, sheet_name='Leads')
-        workbook = writer.book
-        worksheet = writer.sheets['Leads']
-        num_colunas = len(df_lote.columns)
-        worksheet.merge_cells(start_row=1, start_column=1, end_row=1, end_column=num_colunas)
-        cell = worksheet['A1']
-        cell.value = cabecalho_texto
-        cell.font = Font(bold=True)
-        cell.alignment = Alignment(horizontal='center', vertical='center')
-        formatar_planilha(writer, df_lote)
-    
-    output.seek(0)
-    return output
+
+ 
 
 def aba_higienizacao():
-    st.header("Higienização e Geração de Relatórios")
-    uploaded_file = st.file_uploader("Faça upload do arquivo CSV", type=["csv"], key="higienizacao_uploader")
+    # Garante que as variáveis de sessão estejam inicializadas
+    if "structure_type" not in st.session_state:
+        st.session_state.structure_type = "Não Detectada"
+    if "df_clean" not in st.session_state:
+        st.session_state.df_clean = pd.DataFrame()
+    if "missing_cols" not in st.session_state:
+        st.session_state.missing_cols = []
 
+    st.header("Higienização e Geração de Listas - Assertiva e Lemit")
+    st.info("Faça o upload de um arquivo enriquecido do Lemit ou Assertiva, o retorno será uma lista formatada pdf e o arquivo xlsx.")
+    uploaded_file = st.file_uploader("Faça upload do arquivo CSV Assertiva ou Lemit", type=["csv"], key="higienizacao_uploader")
+    
     if uploaded_file:
-        # Reinicia o estado se um novo arquivo for carregado
-        if st.session_state.get('last_uploaded_file') != uploaded_file.name:
-            for key in list(st.session_state.keys()):
-                if key.startswith('map_higienizacao_') or key in ['df_clean', 'df_export', 'processing_complete', 'structure_type']:
-                    del st.session_state[key]
-            st.session_state.last_uploaded_file = uploaded_file.name
-
-        temp_path = "temp_uploaded.csv"
-        with open(temp_path, "wb") as f:
-            f.write(uploaded_file.read())
-        df_raw, err = load_data(temp_path)
-        if err:
-            st.error(err)
-            return
-
-        st.subheader("Pré-visualização dos Dados Brutos")
-        st.dataframe(df_raw.head(50))
-
-        # --- Detecção Automática da Estrutura ---
-        df_cols_set = set(df_raw.columns)
-        # Critérios para Lemit: presença de colunas específicas ou maior correspondência com colunas essenciais Lemit
-        is_lemit = any(col in df_cols_set for col in ['RAZAO_SOCIAL', 'FULL-LOGRADOURO', 'POSSUI-WHATSAPP']) or \
-                   len(df_cols_set.intersection(LEMIT_ESSENTIAL_COLS)) > len(df_cols_set.intersection(ASSERTIVA_ESSENTIAL_COLS))
-        
-        structure_type = "Lemit" if is_lemit else "Assertiva"
-        st.session_state.structure_type = structure_type
-
-        st.subheader("Mapeamento de Colunas")
-        st.info(f"**Estrutura detectada:** {structure_type}. Verifique o mapeamento automático abaixo.")
-
-        essential_cols = LEMIT_ESSENTIAL_COLS if structure_type == "Lemit" else ASSERTIVA_ESSENTIAL_COLS
-        
-        # --- Mapeamento Automático de Colunas ---
-        df_raw_cols = df_raw.columns.tolist()
-        # Mapeamento normalizado para busca case-insensitive e ignorando separadores
-        df_cols_lower_map = {c.lower().replace('_', '').replace('-', ''): c for c in reversed(df_raw_cols)}
-
-        user_col_mapping = {}
-        for col in essential_cols:
-            default_selection = ''
-            # Normaliza a coluna essencial para busca
-            search_key = col.lower().replace('_', '').replace('-', '')
+            df_raw, structure_type, err = load_data(uploaded_file)
+            if err:
+                st.error(err)
+                return
             
-            if search_key in df_cols_lower_map:
-                default_selection = df_cols_lower_map[search_key]
-            
-            try:
-                default_index = df_raw_cols.index(default_selection) + 1 if default_selection else 0
-            except ValueError:
-                default_index = 0
+            # DEBUG: Imprime as colunas do DataFrame carregado
+            print(f"DEBUG: Colunas do DataFrame carregado: {df_raw.columns.tolist()}")
 
-            selected_col = st.selectbox(
-                f"Coluna para '{col}'",
-                options=[''] + df_raw_cols,
-                index=default_index,
-                key=f"map_higienizacao_{col}"
-            )
-            user_col_mapping[col] = selected_col
+            st.session_state.structure_type = structure_type # Atualiza o valor após a detecção
 
-        if st.button("Processar Dados"):
-            with st.spinner("Processando... Aguarde."):
-                df_mapped = df_raw.copy()
-                rename_dict = {v: k for k, v in user_col_mapping.items() if v}
-                df_mapped.rename(columns=rename_dict, inplace=True)
-
-                df_clean, missing, structure = clean_and_filter_data(df_mapped)
-                
-                st.session_state.df_clean = df_clean
-                st.session_state.missing_cols = missing
-                st.session_state.structure_type = structure
-                st.session_state.processing_complete = True
-
-        if st.session_state.get('processing_complete', False):
-            st.subheader("Dados Higienizados")
             st.success(f"Planilha {st.session_state.structure_type} Detectada")
+
+            # Determina as colunas essenciais com base na estrutura detectada
+            essential_cols_to_pass = [] # Inicializa com uma lista vazia
+            if st.session_state.structure_type == "Assertiva":
+                essential_cols_to_pass = ASSERTIVA_ESSENTIAL_COLS
+            elif st.session_state.structure_type == "Lemit":
+                essential_cols_to_pass = LEMIT_ESSENTIAL_COLS
+            else:
+                st.error("Estrutura de planilha desconhecida. Não é possível prosseguir com a higienização.")
+                st.session_state.df_clean = pd.DataFrame() # Garante que df_clean seja um DataFrame vazio
+                st.session_state.missing_cols = [] # Garante que missing_cols seja uma lista vazia
+                return # Sai da função para evitar o erro de desempacotamento
+
+            # Chama clean_and_filter_data com as colunas essenciais
+            st.session_state.df_clean, st.session_state.missing_cols, _ = clean_and_filter_data(df_raw, essential_cols=essential_cols_to_pass)
+
+            if st.session_state.df_clean.empty:
+                st.warning("Atenção: Após a limpeza e filtragem, nenhum dado restou. Verifique os filtros aplicados e o mapeamento das colunas.")
+                return
+
             st.dataframe(st.session_state.df_clean.head(50))
             st.info(f"Linhas finais: {len(st.session_state.df_clean)}")
             if st.session_state.missing_cols:
                 st.warning(f"Colunas essenciais ausentes: {', '.join(st.session_state.missing_cols)}")
 
             df_export = st.session_state.df_clean.drop(columns=['Distancia'], errors='ignore')
-
-            # Limpeza e formatação de colunas para exportação
-            for col_celular in ['SOCIO1Celular1', 'SOCIO1Celular2']:
-                if col_celular in df_export.columns:
-                    df_export[col_celular] = pd.to_numeric(df_export[col_celular], errors='coerce')
-                    df_export[col_celular] = df_export[col_celular].astype('Int64').astype(str)
-                    df_export[col_celular] = df_export[col_celular].apply(lambda x: 
-                        f'+55{str(x).replace("+55", "").replace("55", "")}' if pd.notna(x) and x != '<NA>' else '')
-
-            if 'Numero' in df_export.columns:
-                df_export['Numero'] = pd.to_numeric(df_export['Numero'], errors='coerce')
-                df_export['Numero'] = df_export['Numero'].astype('Int64').astype(str)
-                df_export['Numero'] = df_export['Numero'].apply(lambda x: str(x) if pd.notna(x) and x != '<NA>' else '')
-
+            # Store export dataframe in session_state so download buttons and generators
+            # can consistently access the same buffer/DF instance.
             st.session_state.df_export = df_export
 
             st.subheader("Opções de Exportação")
@@ -206,7 +272,7 @@ def aba_higienizacao():
             filename_input = st.text_input("Nome do arquivo (sem extensão)", value=st.session_state.filename, key="filename_input_key")
             st.session_state.filename = filename_input
 
-            pdf_title_input = st.text_input("Título do PDF", value="Relatório de Clientes", key="pdf_title_input_key")
+            pdf_title_input = st.text_input("Título do PDF", value="Empresários CG", key="pdf_title_input_key")
             st.session_state.pdf_title = pdf_title_input
 
             current_date = datetime.now().strftime('%d-%m-%Y')
@@ -255,12 +321,13 @@ def aba_higienizacao():
                 # st.session_state.excel_buffer = None
 
 def aba_divisor_listas():
-    st.header("Divisor de Listas de Leads")
+    st.header("Divisor de Listas de Leads - Automoveis")
+    st.info("Faça o upload de um arquivo com campos de 'Nome' e 'Celular'. Não é obrigatório ser exatamente os nomes.")
     uploaded_file = st.file_uploader("Faça upload do arquivo XLSX com os leads", type=["xlsx"], key="divisor_uploader")
     
     if uploaded_file:
         # Load raw data immediately after upload to get columns for mapping
-        df_raw_leads, err = load_data(uploaded_file)
+        df_raw_leads, _, err = load_data(uploaded_file)
         if err:
             st.error(err)
             return
@@ -274,8 +341,9 @@ def aba_divisor_listas():
             start_date = st.date_input("Data de Início da Distribuição", value=date.today(), help="Selecione a data a partir da qual a distribuição de leads começará.")
 
         with col2:
-            # Filtro por equipe/supervisor
-            all_teams = list(EQUIPES.keys())
+            # Filtro por equipe/supervisor (dinâmico via JSON)
+            equipes_json = carregar_equipes()
+            all_teams = [e["nome"] for e in equipes_json]
             selected_teams = st.multiselect(
                 "Filtrar por Equipe/Supervisor", 
                 options=all_teams, 
@@ -286,12 +354,16 @@ def aba_divisor_listas():
 
         # Filtrar consultores a serem excluídos (mantido abaixo para melhor visualização de muitas opções)
         consultants_pool = []
+        consultores_json = carregar_consultores()
+        consultores_nomes = [c["consultor"] for c in consultores_json]
         if selected_teams:
             for team in selected_teams:
-                consultants_pool.extend(EQUIPES.get(team, []))
+                for equipe in equipes_json:
+                    if equipe["nome"] == team:
+                        consultants_pool.extend(equipe["consultores"])
             consultants_pool = sorted(list(set(consultants_pool)))
         else:
-            consultants_pool = sorted(CONSULTORES)
+            consultants_pool = sorted(consultores_nomes)
 
         excluded_consultants = st.multiselect(
             "Excluir Consultores Específicos", 
@@ -325,11 +397,8 @@ def aba_divisor_listas():
             # A lista de busca prioriza o nome exato da coluna esperada, depois as sugestões
             search_list = [col] + SUGGESTED_COLUMN_NAMES.get(col, [])
 
-            for suggested_name in search_list:
-                # Busca case-insensitive pela sugestão no mapeamento de colunas do arquivo
-                if suggested_name.lower() in df_cols_lower_map:
-                    default_selection = df_cols_lower_map[suggested_name.lower()]
-                    break
+            # Usa a função de matching robusto para encontrar a melhor coluna
+            default_selection = best_match_column(df_leads_cols, search_list)
             
             # Determina o índice da opção pré-selecionada para o selectbox
             try:
@@ -346,6 +415,8 @@ def aba_divisor_listas():
             )
             user_col_mapping[col] = selected_col
         
+        
+
         if st.button("Processar e Gerar Listas"):
             with st.spinner("Processando... Por favor, aguarde."):
                 try:
@@ -375,7 +446,9 @@ def aba_divisor_listas():
                         df_leads_mapped["Whats"] = df_leads_mapped["Whats"].apply(clean_phone_number)
                         df_leads_mapped.dropna(subset=["Whats"], inplace=True)
                         final_rows = len(df_leads_mapped)
-                        st.info(f"{initial_rows - final_rows} linhas foram removidas por não conterem um número de WhatsApp válido.")
+                        removed = initial_rows - final_rows
+                        if removed > 0:
+                            st.info(f"{removed} linhas foram removidas por não conterem um número de WhatsApp válido.")
                     else:
                         st.warning("A coluna 'Whats' não foi mapeada. Nenhuma filtragem por WhatsApp foi aplicada.")
 
@@ -387,10 +460,12 @@ def aba_divisor_listas():
                     effective_consultores = []
                     if selected_teams:
                         for team in selected_teams:
-                            effective_consultores.extend(EQUIPES.get(team, []))
+                            for equipe in equipes_json:
+                                if equipe["nome"] == team:
+                                    effective_consultores.extend(equipe["consultores"])
                         effective_consultores = list(set(effective_consultores))
                     else:
-                        effective_consultores = list(CONSULTORES)
+                        effective_consultores = list(consultores_nomes)
 
                     if excluded_consultants:
                         effective_consultores = [c for c in effective_consultores if c not in excluded_consultants]
@@ -451,7 +526,12 @@ def aba_divisor_listas():
                                     data_formatada_nome = data_atual.strftime('%d_%m_%Y')
                                     nome_arquivo_base = f"LEADS_AUTOMOVEIS_{primeiro_nome.upper()}_{data_formatada_nome}"
                                     
-                                    nome_equipe = CONSULTOR_PARA_EQUIPE.get(consultor, "Outros")
+                                    # Buscar equipe do consultor via JSON
+                                    nome_equipe = "Outros"
+                                    for equipe in equipes_json:
+                                        if consultor in equipe["consultores"]:
+                                            nome_equipe = equipe["nome"]
+                                            break
                                     zip_file.writestr(f"{nome_equipe}/{nome_arquivo_base}.xlsx", excel_buffer.getvalue())
 
                                     pdf_title = f"Leads Automoveis - {primeiro_nome} {data_atual.strftime('%d/%m')}"
@@ -466,6 +546,10 @@ def aba_divisor_listas():
                             data_atual = proximo_dia_util(data_atual)
                     
                     st.success(f"Processo concluído! {arquivos_gerados} pares de listas (Excel e PDF) foram gerados.")
+
+                    
+
+                    zip_filename = f"Listas_Consultores_{datetime.now().strftime('%d-%m-%Y')}.zip"
                     
                     zip_filename = f"Listas_Consultores_{datetime.now().strftime('%d-%m-%Y')}.zip"
                     st.download_button(
@@ -476,227 +560,462 @@ def aba_divisor_listas():
                     )
 
                 except Exception as e:
+                    logging.exception("Erro ao processar divisor de listas")
                     st.error(f"Ocorreu um erro durante o processamento: {e}")
 
 def aba_gerador_negocios_robos():
     st.header("Gerador de Negócios para Robôs")
 
-    st.info("Esta aba gera planilhas de 'Negócios' para importação em sistemas de robôs, utilizando os arquivos de 'Pessoas Agendor' gerados anteriormente.")
+    # --- Lógica de Detecção de Fonte de Dados ---
+    source_mode = st.session_state.get('source_for_negocios', 'upload') # Default to upload
 
-    input_folder_path = st.text_input("Caminho da pasta com os arquivos de 'Pessoas Agendor' (ex: pessoas_geradas)", value="pessoas_geradas", help="Insira o caminho da pasta que contém os arquivos XLSX de 'Pessoas Agendor'. O script buscará em subpastas também.")
+    # Se o handoff foi ativado, muda o modo
+    if st.session_state.get('handoff_active', False):
+        source_mode = 'handoff'
 
-    if input_folder_path:
+    # --- Renderização da UI baseada no modo ---
+
+    # MODO 1: Handoff a partir da aba Pessoas Agendor
+    if source_mode == 'handoff':
+        st.info("Gerando negócios a partir dos leads recém-criados na aba anterior.")
+        
+        generated_files = st.session_state.get('generated_pessoas_files', {})
+        if not generated_files:
+            st.error("Não foram encontrados dados de leads para processar. Por favor, gere os arquivos na aba 'Automação Pessoas Agendor' primeiro.")
+            st.session_state.handoff_active = False # Limpa a flag
+            return
+
+        st.subheader(f"{len(generated_files)} arquivo(s) de 'Pessoas' pronto(s) para processar.")
+
+        # --- Configurações de Negócio (Interface Simplificada) ---
         st.subheader("Configurações para Geração de Negócios")
-
         col1, col2 = st.columns(2)
         with col1:
-            negocios_por_consultor = st.number_input("Número de negócios por consultor (por arquivo)", min_value=1, value=20, help="Define quantos leads serão incluídos em cada arquivo de negócio gerado para um consultor.")
+            negocios_por_consultor = st.number_input("Número de negócios por consultor (por arquivo)", min_value=1, value=20, key="negocios_handoff")
         with col2:
-            start_date_negocios = st.date_input("Data de Início para Negócios", value=date.today(), help="A data de início para o primeiro arquivo de negócio. As datas subsequentes serão incrementadas, pulando finais de semana.")
+            start_date_negocios = st.date_input("Data de Início para Negócios", value=date.today(), key="date_handoff")
 
         col3, col4 = st.columns(2)
         with col3:
-            nicho_principal = st.text_input("Nicho Principal (ex: AUTO, MED, EMPR)", value="AUTO", help="O nicho principal para o 'Título do negócio'.")
+            nicho_principal = st.text_input("Nicho Principal (ex: AUTO, MED, EMPR)", value="AUTO", key="nicho_handoff")
         with col4:
-            sufixo_localidade = st.text_input("Sufixo de Localidade (opcional, ex: CG, MS)", value="", help="Um sufixo opcional para o nicho, como a localidade.")
+            sufixo_localidade = st.text_input("Sufixo de Localidade (opcional, ex: CG, MS)", value="", key="sufixo_handoff")
         
-        if st.button("Gerar Arquivos de Negócios"):
-            if not input_folder_path:
-                st.warning("Por favor, insira o caminho da pasta com os arquivos de 'Pessoas Agendor'.")
+        if st.button("Gerar Arquivos de Negócios", key="btn_gerar_handoff"):
+            # A lógica de geração usará `generated_files` do session_state
+            processar_e_gerar_negocios(negocios_por_consultor, start_date_negocios, nicho_principal, sufixo_localidade, source_data=generated_files)
+            # Limpa a flag após o processo
+            st.session_state.handoff_active = False
+            st.session_state.source_for_negocios = 'upload' # Reseta para o padrão
+
+    # MODO 2: Upload de arquivo cru
+    else:
+        st.info("Faça o upload de um arquivo de leads (XLSX ou CSV) para iniciar a geração de negócios.")
+        uploaded_file = st.file_uploader("Selecione um arquivo de leads", type=["xlsx", "csv"], key="negocios_uploader")
+
+        if uploaded_file:
+            # Reset handoff state if a new file is uploaded in raw mode
+            if st.session_state.get('source_for_negocios') == 'handoff':
+                st.session_state.handoff_active = False
+                st.session_state.source_for_negocios = 'upload'
+
+            df_raw_leads, _, err = load_data(uploaded_file)
+            if err:
+                st.error(err)
                 return
 
-            if not nicho_principal:
-                st.error("Por favor, insira o Nicho Principal.")
-                return
+            st.dataframe(df_raw_leads.head())
 
-            with st.spinner("Gerando arquivos de Negócios... Por favor, aguarde."):
-                all_generated_files = {}
+            # --- Mapeamento de Colunas ---
+            st.subheader("1. Mapeamento de Colunas")
+            df_cols = df_raw_leads.columns.tolist()
 
-                # Construir o caminho absoluto para a pasta de entrada
-                project_root = os.getcwd()
-                absolute_input_path = os.path.join(project_root, input_folder_path)
+            # Heurística de pré-seleção: tenta detectar automaticamente as colunas de Nome e WhatsApp
+            df_cols_lower_map = {c.lower(): c for c in df_cols}
+            SUGGESTED_NAME_COLS = ["nome", "nome completo", "name", "razao social", "razão social", "empresa"]
+            SUGGESTED_WHATS_COLS = ["whats", "whatsapp", "telefone", "celular", "contato"]
 
-                # Verificar se a pasta existe
-                if not os.path.isdir(absolute_input_path):
-                    st.error(f"A pasta especificada não foi encontrada: {absolute_input_path}")
+            # Usa matching robusto para tentar encontrar as colunas de nome e whatsapp
+            default_nome = best_match_column(df_cols, SUGGESTED_NAME_COLS)
+            default_whats = best_match_column(df_cols, SUGGESTED_WHATS_COLS)
+
+            # Se houver uma coluna explicitamente contendo 'whats' ou 'whatsapp', prefira-a
+            explicit_whats = None
+            for c in df_cols:
+                cl = c.lower()
+                if 'whats' in cl or 'whatsapp' in cl:
+                    explicit_whats = c
+                    break
+            if explicit_whats:
+                # Só sobrescreve se a detecção atual não for explícita
+                if not default_whats or ('whats' not in default_whats.lower() and 'whatsapp' not in default_whats.lower()):
+                    default_whats = explicit_whats
+
+            # Determinar índices padrão para os selectboxes
+            try:
+                default_nome_index = df_cols.index(default_nome) + 1 if default_nome else 0
+            except ValueError:
+                default_nome_index = 0
+            try:
+                default_whats_index = df_cols.index(default_whats) + 1 if default_whats else 0
+            except ValueError:
+                default_whats_index = 0
+
+            map_col1, map_col2 = st.columns(2)
+            with map_col1:
+                nome_col = st.selectbox("Coluna com o NOME do lead", [''] + df_cols, index=default_nome_index, key="map_nome_negocios")
+            with map_col2:
+                whats_col = st.selectbox("Coluna com o WHATSAPP do lead", [''] + df_cols, index=default_whats_index, key="map_whats_negocios")
+
+            # --- Distribuição de Consultores ---
+            st.subheader("2. Distribuição de Consultores")
+            dist_mode = st.radio(
+                "Como distribuir os leads?",
+                ["Distribuir para Todos", "Distribuir para Todos, EXCETO...", "Distribuir APENAS para..."],
+                key="dist_mode_negocios"
+            )
+
+            consultores_json = carregar_consultores()
+            consultores_nomes = sorted([c["consultor"] for c in consultores_json])
+            effective_consultores = []
+            if dist_mode == "Distribuir para Todos":
+                effective_consultores = consultores_nomes
+                st.success(f"{len(effective_consultores)} consultores receberão os leads.")
+            elif dist_mode == "Distribuir para Todos, EXCETO...":
+                excluded = st.multiselect("Selecione os consultores a EXCLUIR:", options=consultores_nomes, key="exclude_negocios")
+                effective_consultores = [c for c in consultores_nomes if c not in excluded]
+                st.success(f"{len(effective_consultores)} consultores receberão os leads.")
+            elif dist_mode == "Distribuir APENAS para...":
+                included = st.multiselect("Selecione os consultores a INCLUIR:", options=consultores_nomes, key="include_negocios")
+                effective_consultores = included
+                st.success(f"{len(effective_consultores)} consultores receberão os leads.")
+
+            # --- Configurações de Negócio ---
+            st.subheader("3. Configurações para Geração de Negócios")
+            col1, col2 = st.columns(2)
+            with col1:
+                negocios_por_consultor_upload = st.number_input("Número de negócios por consultor (por arquivo)", min_value=1, value=20, key="negocios_upload")
+            with col2:
+                start_date_negocios_upload = st.date_input("Data de Início para Negócios", value=date.today(), key="date_upload")
+
+            col3, col4 = st.columns(2)
+            with col3:
+                nicho_principal_upload = st.text_input("Nicho Principal (ex: AUTO, MED, EMPR)", value="AUTO", key="nicho_upload")
+            with col4:
+                sufixo_localidade_upload = st.text_input("Sufixo de Localidade (opcional, ex: CG, MS)", value="", key="sufixo_upload")
+
+            generate_button_disabled = not nome_col or not whats_col
+            if generate_button_disabled:
+                st.warning("Mapeamento de colunas 'Nome' e 'WhatsApp' é obrigatório para gerar os arquivos.")
+
+            if st.button("Gerar Arquivos de Negócios", key="btn_gerar_upload", disabled=generate_button_disabled):
+                if not effective_consultores:
+                    st.error("Nenhum consultor foi selecionado para a distribuição. Verifique os filtros.")
                     return
-
-                # Encontrar todos os arquivos XLSX na pasta e subpastas
-                all_pessoas_files = glob.glob(os.path.join(absolute_input_path, "**/*.xlsx"), recursive=True)
-
-                if not all_pessoas_files:
-                    st.warning(f"Nenhum arquivo XLSX encontrado na pasta: {absolute_input_path}")
-                    return
-
-                for file_path in all_pessoas_files:
-                    try:
-                        df_pessoas, err = load_data(file_path)
-                        if err:
-                            st.warning(f"Erro ao carregar {os.path.basename(file_path)}: {err}. Pulando este arquivo.")
-                            continue
-                        
-                        # Extrair o nome do consultor do nome do arquivo de pessoas
-                        # Ex: PESSOAS_GERAL_CG_CONSULTOR_NOME_16-07-2025.xlsx
-                        file_name_only = os.path.basename(file_path)
-                        file_name_parts = file_name_only.replace(".xlsx", "").split('_')
-                        consultor_nome_arquivo = ""
-                        if len(file_name_parts) >= 4:
-                            consultor_nome_arquivo = file_name_parts[3] # Pega o nome do consultor
-                        
-                        if not consultor_nome_arquivo:
-                            st.warning(f"Não foi possível extrair o nome do consultor do arquivo: {file_name_only}. Pulando este arquivo.")
-                            continue
-
-                        # Colunas da planilha de Negócios
-                        colunas_negocios = [
-                            "Título do negócio", "Empresa relacionada", "Pessoa relacionada",
-                            "Usuário responsável", "Data de início", "Data de conclusão",
-                            "Valor Total", "Funil", "Etapa", "Status", "Motivo de perda",
-                            "Descrição do motivo de perda", "Ranking", "Descrição", "Produtos e Serviços"
-                        ]
-
-                        leads_do_consultor = df_pessoas.copy()
-                        
-                        # Garantir que as colunas essenciais existam
-                        required_cols_pessoas = ["Nome", "Usuário responsável", "WhatsApp"]
-                        if not all(col in leads_do_consultor.columns for col in required_cols_pessoas):
-                            st.warning(f"Arquivo {file_name_only} não contém todas as colunas essenciais (Nome, Usuário responsável, WhatsApp). Pulando este arquivo.")
-                            continue
-
-                        # Limpar e formatar WhatsApp para uso em Data de Conclusão
-                        leads_do_consultor["WhatsApp_Clean"] = leads_do_consultor["WhatsApp"].apply(clean_phone_number)
-                        leads_do_consultor["WhatsApp_Clean"] = leads_do_consultor["WhatsApp_Clean"].apply(lambda x: str(int(x)) if pd.notna(x) else "")
-
-                        num_leads_consultor = len(leads_do_consultor)
-                        leads_processados_consultor = 0
-                        current_date = start_date_negocios
-                        file_counter = 1
-
-                        while leads_processados_consultor < num_leads_consultor:
-                            inicio_lote = leads_processados_consultor
-                            fim_lote = min(leads_processados_consultor + negocios_por_consultor, num_leads_consultor)
-                            df_lote_negocios = leads_do_consultor.iloc[inicio_lote:fim_lote].copy()
-
-                            if not df_lote_negocios.empty:
-                                dados_negocios = []
-                                for _, row_lead in df_lote_negocios.iterrows():
-                                    nome_pessoa = row_lead.get("Nome", "")
-                                    usuario_responsavel = row_lead.get("Usuário responsável", "")
-                                    whatsapp_lead = row_lead.get("WhatsApp_Clean", "")
-
-                                    # Formatar Título do negócio
-                                    mes_ano = datetime.now().strftime('%m/%y')
-                                    nicho_formatado_titulo = nicho_principal.upper()
-                                    if sufixo_localidade:
-                                        nicho_formatado_titulo += f" {sufixo_localidade.upper()}"
-                                    
-                                    titulo_negocio = f"{mes_ano} - RB - {nicho_formatado_titulo} - {nome_pessoa}/ESPs"
-
-                                    linha_negocio = {
-                                        "Título do negócio": titulo_negocio,
-                                        "Empresa relacionada": "", # Deixar em branco
-                                        "Pessoa relacionada": nome_pessoa,
-                                        "Usuário responsável": usuario_responsavel,
-                                        "Data de início": current_date.strftime('%d/%m/%Y'),
-                                        "Data de conclusão": whatsapp_lead, # WhatsApp temporariamente aqui
-                                        "Valor Total": "", # Deixar em branco
-                                        "Funil": "Funil de Vendas",
-                                        "Etapa": "Prospecção",
-                                        "Status": "Em andamento",
-                                        "Motivo de perda": "", # Deixar em branco
-                                        "Descrição do motivo de perda": "", # Deixar em branco
-                                        "Ranking": "", # Deixar em branco
-                                        "Descrição": "", # Deixar em branco
-                                        "Produtos e Serviços": "" # Deixar em branco
-                                    }
-                                    dados_negocios.append(linha_negocio)
-                                
-                                df_final_negocios = pd.DataFrame(dados_negocios, columns=colunas_negocios)
-
-                                output_excel_negocios = io.BytesIO()
-                                with pd.ExcelWriter(output_excel_negocios, engine='openpyxl') as writer:
-                                    df_final_negocios.to_excel(writer, index=False)
-                                output_excel_negocios.seek(0)
-
-                                # Nome do arquivo de negócios
-                                nome_arquivo_negocios = f"NEGOCIOS_{consultor_nome_arquivo.upper()}_{nicho_principal.upper()}"
-                                if sufixo_localidade:
-                                    nome_arquivo_negocios += f"_{sufixo_localidade.upper()}"
-                                nome_arquivo_negocios += f"_{current_date.strftime('%d-%m-%Y')}.xlsx"
-                                
-                                # Obter o caminho relativo da pasta do consultor para o ZIP
-                                # Ex: pessoas_geradas/Equipe Camila/PESSOAS_... -> Equipe Camila/
-                                relative_path_parts = os.path.relpath(os.path.dirname(file_path), absolute_input_path).split(os.sep)
-                                consultor_zip_folder = "" # Default para o root do zip
-                                if len(relative_path_parts) > 0 and relative_path_parts[0] != '.': # Se não for o root da pasta de input
-                                    consultor_zip_folder = os.path.join(*relative_path_parts) + os.sep
-
-                                all_generated_files[os.path.join(consultor_zip_folder, nome_arquivo_negocios)] = output_excel_negocios.getvalue()
-
-                                leads_processados_consultor += len(df_lote_negocios)
-                                current_date = proximo_dia_util(current_date) # Avança a data para o próximo arquivo
-                                file_counter += 1
-
-                    except Exception as e:
-                        st.error(f"Erro ao processar o arquivo {os.path.basename(file_path)}: {e}")
-                        continue
                 
-                if all_generated_files:
-                    zip_buffer = io.BytesIO()
-                    with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
-                        for file_name_in_zip, file_data in all_generated_files.items():
-                            zip_file.writestr(file_name_in_zip, file_data)
+                # Preparar o DataFrame
+                df_renamed = df_raw_leads.rename(columns={nome_col: "Nome", whats_col: "WhatsApp"})
+                df_renamed["WhatsApp"] = df_renamed["WhatsApp"].apply(clean_phone_number)
+                df_renamed.dropna(subset=["WhatsApp"], inplace=True)
+
+                if df_renamed.empty:
+                    st.warning("Após a filtragem, não restaram leads para distribuir.")
+                    return
+
+                processar_e_gerar_negocios(
+                    negocios_por_consultor_upload,
+                    start_date_negocios_upload,
+                    nicho_principal_upload,
+                    sufixo_localidade_upload,
+                    df_raw=df_raw_leads, # Pass the raw DataFrame
+                    col_mapping={"Nome": nome_col, "WhatsApp": whats_col}, # Pass the column mapping
+                    effective_consultores=effective_consultores # Pass the effective consultants
+                )
+
+
+def processar_e_gerar_negocios(negocios_por_consultor, start_date_negocios, nicho_principal, sufixo_localidade, source_data=None, df_raw=None, col_mapping=None, effective_consultores=None):
+    """Função unificada para gerar arquivos de negócios."""
+    with st.spinner("Gerando arquivos de Negócios... Por favor, aguarde."):
+        all_generated_files = {}
+
+        if source_data is not None: # Modo Handoff ou Upload pré-processado
+            for file_name, file_data in source_data.items():
+                try:
+                    df_pessoas = pd.read_excel(io.BytesIO(file_data))
+                    # Extrair o nome do consultor do nome do arquivo de pessoas
+                    file_name_only = os.path.basename(file_name)
+                    file_name_parts = file_name_only.replace(".xlsx", "").split('_')
+                    consultor_nome_arquivo = ""
+                    if len(file_name_parts) >= 4:
+                        consultor_nome_arquivo = file_name_parts[3] # Pega o nome do consultor
                     
-                    zip_filename = f"Negocios_Robos_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
-                    st.download_button(
-                        label="Baixar Todos os Arquivos de Negócios (ZIP)",
-                        data=zip_buffer.getvalue(),
-                        file_name=zip_filename,
-                        mime="application/zip"
-                    )
-                    st.success(f"Processo concluído! {len(all_generated_files)} arquivos de Negócios gerados.")
-                else:
-                    st.warning("Nenhum arquivo de Negócios foi gerado. Verifique os arquivos de entrada e as configurações.")
+                    if not consultor_nome_arquivo:
+                        st.warning(f"Não foi possível extrair o nome do consultor do arquivo: {file_name_only}. Pulando este arquivo.")
+                        continue
+
+                    # Colunas da planilha de Negócios
+                    colunas_negocios = [
+                        "Título do negócio", "Empresa relacionada", "Pessoa relacionada",
+                        "Usuário responsável", "Data de início", "Data de conclusão",
+                        "Valor Total", "Funil", "Etapa", "Status", "Motivo de perda",
+                        "Descrição do motivo de perda", "Ranking", "Descrição", "Produtos e Serviços"
+                    ]
+
+                    leads_do_consultor = df_pessoas.copy()
+                    
+                    # Garantir que as colunas essenciais existam
+                    required_cols_pessoas = ["Nome", "Usuário responsável", "WhatsApp"]
+                    if not all(col in leads_do_consultor.columns for col in required_cols_pessoas):
+                        st.warning(f"Arquivo {file_name_only} não contém todas as colunas essenciais (Nome, Usuário responsável, WhatsApp). Pulando este arquivo.")
+                        continue
+
+                    # Limpar e formatar WhatsApp para uso em Data de Conclusão
+                    leads_do_consultor["WhatsApp_Clean"] = leads_do_consultor["WhatsApp"].apply(clean_phone_number)
+                    leads_do_consultor["WhatsApp_Clean"] = leads_do_consultor["WhatsApp_Clean"].apply(lambda x: str(x) if pd.notna(x) else "")
+
+                    num_leads_consultor = len(leads_do_consultor)
+                    leads_processados_consultor = 0
+                    current_date = start_date_negocios
+                    file_counter = 1
+
+                    while leads_processados_consultor < num_leads_consultor:
+                        inicio_lote = leads_processados_consultor
+                        fim_lote = min(leads_processados_consultor + negocios_por_consultor, num_leads_consultor)
+                        df_lote_negocios = leads_do_consultor.iloc[inicio_lote:fim_lote].copy()
+
+                        if not df_lote_negocios.empty:
+                            dados_negocios = []
+                            for _, row_lead in df_lote_negocios.iterrows():
+                                nome_pessoa = row_lead.get("Nome", "")
+                                usuario_responsavel = row_lead.get("Usuário responsável", "")
+                                whatsapp_lead = row_lead.get("WhatsApp_Clean", "")
+                                # Garantir DDI +55 no campo usado para Data de conclusão
+                                whatsapp_lead_full = f"+55{whatsapp_lead}" if whatsapp_lead else ""
+
+                                # Formatar Título do negócio usando a data do arquivo (current_date)
+                                mes_ano = current_date.strftime('%m/%y')
+                                nicho_formatado_titulo = nicho_principal.upper()
+                                if sufixo_localidade:
+                                    nicho_formatado_titulo += f" {sufixo_localidade.upper()}"
+                                
+                                titulo_negocio = f"{mes_ano} - RB - {nicho_formatado_titulo} - {nome_pessoa}/ESPs"
+
+                                linha_negocio = {
+                                    "Título do negócio": titulo_negocio,
+                                    "Empresa relacionada": "", # Deixar em branco
+                                    "Pessoa relacionada": nome_pessoa,
+                                    "Usuário responsável": usuario_responsavel,
+                                    "Data de início": current_date.strftime('%d/%m/%Y'),
+                                    "Data de conclusão": whatsapp_lead_full, # WhatsApp com DDI +55
+                                    "Valor Total": "", # Deixar em branco
+                                    "Funil": "Funil de Vendas",
+                                    "Etapa": "Prospecção",
+                                    "Status": "Em andamento",
+                                    "Motivo de perda": "", # Deixar em branco
+                                    "Descrição do motivo de perda": "", # Deixar em branco
+                                    "Ranking": "", # Deixar em branco
+                                    "Descrição": "", # Deixar em branco
+                                    "Produtos e Serviços": "" # Deixar em branco
+                                }
+                                dados_negocios.append(linha_negocio)
+                            
+                            df_final_negocios = pd.DataFrame(dados_negocios, columns=colunas_negocios)
+
+                            output_excel_negocios = io.BytesIO()
+                            with pd.ExcelWriter(output_excel_negocios, engine='openpyxl') as writer:
+                                df_final_negocios.to_excel(writer, index=False)
+                            output_excel_negocios.seek(0)
+
+                            # Nome do arquivo de negócios
+                            nome_arquivo_negocios = f"NEGOCIOS_{consultor_nome_arquivo.upper()}_{nicho_principal.upper()}"
+                            if sufixo_localidade:
+                                nome_arquivo_negocios += f"_{sufixo_localidade.upper()}"
+                            nome_arquivo_negocios += f"_{current_date.strftime('%d-%m-%Y')}.xlsx"
+                            
+                            all_generated_files[nome_arquivo_negocios] = output_excel_negocios.getvalue()
+
+                            leads_processados_consultor += len(df_lote_negocios)
+                            current_date = proximo_dia_util(current_date) # Avança a data para o próximo arquivo
+                            file_counter += 1
+
+                except Exception as e:
+                    logging.exception(f"Erro ao processar o arquivo {file_name}")
+                    st.error(f"Erro ao processar o arquivo {file_name}: {e}")
+                    continue
+        
+        else: # Modo de upload de arquivo cru (df_raw, col_mapping, effective_consultores)
+            if df_raw is None or col_mapping is None or effective_consultores is None:
+                st.error("Erro interno: Parâmetros ausentes para o modo de arquivo cru.")
+                return
+
+            # Preparar o DataFrame
+            df_renamed = df_raw.rename(columns={col_mapping["Nome"]: "Nome", col_mapping["WhatsApp"]: "WhatsApp"})
+            df_renamed["WhatsApp"] = df_renamed["WhatsApp"].apply(clean_phone_number)
+            df_renamed.dropna(subset=["WhatsApp"], inplace=True)
+
+            if df_renamed.empty:
+                st.warning("Após a filtragem, não restaram leads para distribuir.")
+                return
+
+            # Distribuir leads entre consultores
+            leads_por_consultor_dist = np.array_split(df_renamed, len(effective_consultores))
+            
+            # Colunas da planilha de Negócios
+            colunas_negocios = [
+                "Título do negócio", "Empresa relacionada", "Pessoa relacionada",
+                "Usuário responsável", "Data de início", "Data de conclusão",
+                "Valor Total", "Funil", "Etapa", "Status", "Motivo de perda",
+                "Descrição do motivo de perda", "Ranking", "Descrição", "Produtos e Serviços"
+            ]
+
+            leads_processados = 0
+            current_date = start_date_negocios
+            file_counter = 1
+
+            for i, consultor in enumerate(effective_consultores):
+                # Colunas da planilha de Negócios
+                colunas_negocios = [
+                    "Título do negócio", "Empresa relacionada", "Pessoa relacionada",
+                    "Usuário responsável", "Data de início", "Data de conclusão",
+                    "Valor Total", "Funil", "Etapa", "Status", "Motivo de perda",
+                    "Descrição do motivo de perda", "Ranking", "Descrição", "Produtos e Serviços"
+                ]
+
+                current_date = start_date_negocios
+                file_counter = 1
+
+                for consultor in effective_consultores:
+                    df_consultor = df_renamed.copy()
+                    total_leads = len(df_consultor)
+                    leads_processados = 0
+                    while leads_processados < total_leads:
+                        inicio_lote = leads_processados
+                        fim_lote = min(leads_processados + negocios_por_consultor, total_leads)
+                        df_lote_negocios = df_consultor.iloc[inicio_lote:fim_lote].copy()
+                        if not df_lote_negocios.empty:
+                            dados_negocios = []
+                            for _, row_lead in df_lote_negocios.iterrows():
+                                nome_pessoa = row_lead.get("Nome", "")
+                                usuario_responsavel = consultor.lower().replace(' ', '.')
+                                whatsapp_lead = row_lead.get("WhatsApp", "")
+                                cleaned = clean_phone_number(whatsapp_lead)
+                                whatsapp_lead_clean = str(cleaned) if pd.notna(cleaned) else ""
+                                # Garantir DDI +55 no campo usado para Data de conclusão
+                                whatsapp_lead_full = f"+55{whatsapp_lead_clean}" if whatsapp_lead_clean else ""
+
+                                # Use the file's current_date for month/year in title
+                                mes_ano = current_date.strftime('%m/%y')
+                                nicho_formatado_titulo = nicho_principal.upper()
+                                if sufixo_localidade:
+                                    nicho_formatado_titulo += f" {sufixo_localidade.upper()}"
+                                titulo_negocio = f"{mes_ano} - RB - {nicho_formatado_titulo} - {nome_pessoa}/ESPs"
+
+                                linha_negocio = {
+                                    "Título do negócio": titulo_negocio,
+                                    "Empresa relacionada": "",
+                                    "Pessoa relacionada": nome_pessoa,
+                                    "Usuário responsável": usuario_responsavel,
+                                    "Data de início": current_date.strftime('%d/%m/%Y'),
+                                    "Data de conclusão": whatsapp_lead_full,
+                                    "Valor Total": "",
+                                    "Funil": "Funil de Vendas",
+                                    "Etapa": "Prospecção",
+                                    "Status": "Em andamento",
+                                    "Motivo de perda": "",
+                                    "Descrição do motivo de perda": "",
+                                    "Ranking": "",
+                                    "Descrição": "",
+                                    "Produtos e Serviços": ""
+                                }
+                                dados_negocios.append(linha_negocio)
+                            df_final_negocios = pd.DataFrame(dados_negocios, columns=colunas_negocios)
+
+                            output_excel_negocios = io.BytesIO()
+                            with pd.ExcelWriter(output_excel_negocios, engine='openpyxl') as writer:
+                                df_final_negocios.to_excel(writer, index=False)
+                            output_excel_negocios.seek(0)
+
+                            primeiro_nome_consultor = consultor.split(' ')[0].upper()
+                            nome_arquivo_negocios = f"NEGOCIOS_{primeiro_nome_consultor}_{nicho_principal.upper()}"
+                            if sufixo_localidade:
+                                nome_arquivo_negocios += f"_{sufixo_localidade.upper()}"
+                            nome_arquivo_negocios += f"_{current_date.strftime('%d-%m-%Y')}.xlsx"
+
+                            all_generated_files[nome_arquivo_negocios] = output_excel_negocios.getvalue()
+
+                            leads_processados += len(df_lote_negocios)
+                            current_date = proximo_dia_util(current_date)
+                            file_counter += 1
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
+                for file_name_in_zip, file_data in all_generated_files.items():
+                    zip_file.writestr(file_name_in_zip, file_data)
+            # Nome do zip: se só um consultor, usa o nome dele, senão usa "varios"
+            if len(effective_consultores) == 1:
+                # Buscar usuário do consultor
+                usuario = None
+                try:
+                    with open(CONSULTORES_FILE, "r", encoding="utf-8") as f:
+                        consultores_data = json.load(f)
+                        for c in consultores_data:
+                            if c["consultor"].strip().lower() == effective_consultores[0].strip().lower():
+                                usuario = c["usuario"].replace(" ", "_").lower()
+                                break
+                except Exception:
+                    usuario = effective_consultores[0].replace(" ", "_").lower()
+                zip_filename = f"Negocios_Robos_{usuario}.zip"
+            else:
+                zip_filename = f"Negocios_Robos_varios.zip"
+            st.download_button(
+                label="Baixar Todos os Arquivos de Negócios (ZIP)",
+                data=zip_buffer.getvalue(),
+                file_name=zip_filename,
+                mime="application/zip",
+                key="download_negocios_zip"
+            )
+            st.success(f"Processo concluído! {len(all_generated_files)} arquivos de Negócios gerados.")
+            # Reset session state flags after successful generation
+            st.session_state.handoff_active = False
+            st.session_state.source_for_negocios = 'upload'
+        if not all_generated_files:
+            st.warning("Nenhum arquivo de Negócios foi gerado. Verifique os arquivos de entrada e as configurações.")
+
 
 
 def aba_automacao_pessoas_agendor():
     st.header("Automação Pessoas Agendor")
+    st.info("Faça o upload de um arquivo de lista para iniciar a geração de pessoas. Obrigatório que o arquivo contenha as colunas 'NOME' e 'Whats'.")
 
     uploaded_file = st.file_uploader("Faça upload do arquivo XLSX com os leads", type=["xlsx"], key="geracao_pessoas_uploader")
 
     if uploaded_file:
-        df_raw_leads, err = load_data(uploaded_file)
+        df_raw_leads, _, err = load_data(uploaded_file)
         if err:
             st.error(err)
             return
 
         st.subheader("Opções de Filtragem e Distribuição")
-        
-        # Filtro por equipe/supervisor
-        all_teams = list(EQUIPES.keys())
-        selected_teams = st.multiselect(
-            "Filtrar por Equipe/Supervisor", 
-            options=all_teams, 
-            default=all_teams,
-            help="Selecione as equipes cujos consultores devem receber leads. Se nenhuma for selecionada, todos os consultores serão considerados inicialmente.",
-            key="agendor_filter_teams"
+
+        dist_mode = st.radio(
+            "Como distribuir os leads?",
+            ["Distribuir para Todos", "Distribuir para Todos, EXCETO...", "Distribuir APENAS para..."],
+            key="dist_mode_agendor"
         )
 
-        # Filtrar consultores a serem excluídos
-        consultants_pool = []
-        if selected_teams:
-            for team in selected_teams: 
-                consultants_pool.extend(EQUIPES.get(team, []))
-            consultants_pool = sorted(list(set(consultants_pool)))
-        else:
-            consultants_pool = sorted(CONSULTORES)
-
-        excluded_consultants = st.multiselect(
-            "Excluir Consultores Específicos", 
-            options=consultants_pool,
-            help="Selecione os consultores que NÃO devem receber leads nesta distribuição.",
-            key="agendor_exclude_consultants"
-        )
+        consultores_json = carregar_consultores()
+        consultores_nomes = sorted([c["consultor"] for c in consultores_json])
+        effective_consultores = []
+        if dist_mode == "Distribuir para Todos":
+            effective_consultores = consultores_nomes
+            st.success(f"{len(effective_consultores)} consultores receberão os leads.")
+        elif dist_mode == "Distribuir para Todos, EXCETO...":
+            excluded = st.multiselect("Selecione os consultores a EXCLUIR:", options=consultores_nomes, key="exclude_agendor")
+            effective_consultores = [c for c in consultores_nomes if c not in excluded]
+            st.success(f"{len(effective_consultores)} consultores receberão os leads.")
+        elif dist_mode == "Distribuir APENAS para...":
+            included = st.multiselect("Selecione os consultores a INCLUIR:", options=consultores_nomes, key="include_agendor")
+            effective_consultores = included
+            st.success(f"{len(effective_consultores)} consultores receberão os leads.")
 
         st.subheader("Configurações Adicionais para Agendor")
         default_cargo = st.text_input("Cargo Padrão", value="Lead Automovel", help="Cargo a ser atribuído aos leads no Agendor.")
@@ -711,16 +1030,20 @@ def aba_automacao_pessoas_agendor():
         
         # Suggested column names for pre-selection
         SUGGESTED_COLUMN_NAMES_AGENDOR = {
-            "NOME": ["NOME", "Nome Completo", "Socio1Nome", "Razao Social", "Empresa", "NOME/RAZAO_SOCIAL"],
+            "NOME": ["NOME", "Nome Completo", "Socio1Nome", "Razao Social", "Razão Social", "Empresa", "NOME/RAZAO_SOCIAL"],
             "Whats": ["Whats", "WhatsApp", "Telefone", "Celular", "Contato", "CELULAR1", "CELULAR2", "SOCIO1Celular1"],
             "CEL": ["CEL", "Celular", "Telefone", "Whats", "WhatsApp", "CELULAR1", "CELULAR2", "SOCIO1Celular2"],
             "Rua": ["Rua", "Logradouro", "Endereco", "Endereço"],
             "Número": ["Numero", "Número", "Num"],
             "Bairro": ["Bairro"],
-            "Cidade": ["Cidade"]
+            "Cidade": ["Cidade"],
+            "CEP": ["CEP", "Cep", "cep", "Codigo Postal", "Código Postal", "CodigoPostal"],
+            "Razao Social": ["Razao Social", "Razão Social", "Razao", "RAZAO_SOCIAL"],
+            "Fantasia": ["Fantasia", "Nome Fantasia", "NomeFantasia"],
+            "Complemento": ["Complemento", "Complemento Endereco", "Comp"]
         }
 
-        expected_cols_agendor = ["NOME", "Whats", "CEL", "Rua", "Número", "Bairro", "Cidade"]
+        expected_cols_agendor = ["NOME", "Whats", "CEL", "Rua", "Número", "Bairro", "Cidade", "CEP", "Razao Social", "Fantasia", "Complemento"]
         user_col_mapping = {}
         # Mapeia as colunas do arquivo para minúsculas para busca case-insensitive
         df_cols_lower_map = {c.lower(): c for c in reversed(df_leads_cols)}
@@ -731,11 +1054,21 @@ def aba_automacao_pessoas_agendor():
             # A lista de busca prioriza o nome exato da coluna esperada, depois as sugestões
             search_list = [col] + SUGGESTED_COLUMN_NAMES_AGENDOR.get(col, [])
 
-            for suggested_name in search_list:
-                # Busca case-insensitive pela sugestão no mapeamento de colunas do arquivo
-                if suggested_name.lower() in df_cols_lower_map:
-                    default_selection = df_cols_lower_map[suggested_name.lower()]
-                    break
+            # Usa matching robusto (substring/similarity) para encontrar a melhor coluna
+            default_selection = best_match_column(df_leads_cols, search_list)
+
+            # Preferência explícita: se estivermos buscando pela coluna de Whats,
+            # prefira qualquer coluna que contenha 'whats' ou 'whatsapp' no nome.
+            if col.lower() == 'whats':
+                explicit_whats = None
+                for c in df_leads_cols:
+                    cl = c.lower()
+                    if 'whats' in cl or 'whatsapp' in cl:
+                        explicit_whats = c
+                        break
+                if explicit_whats:
+                    if not default_selection or ('whats' not in default_selection.lower() and 'whatsapp' not in default_selection.lower()):
+                        default_selection = explicit_whats
             
             # Determina o índice da opção pré-selecionada para o selectbox
             try:
@@ -752,7 +1085,15 @@ def aba_automacao_pessoas_agendor():
             )
             user_col_mapping[col] = selected_col
 
-        leads_por_consultor = st.number_input("Número de leads por consultor", min_value=1, value=50)
+        # Se houver apenas 1 consultor efetivo, por padrão ele receberá todos os leads.
+        # Apresentamos uma opção para forçar a divisão em lotes mesmo com 1 consultor.
+        if len(effective_consultores) == 1:
+            force_split = st.checkbox("Forçar divisão em lotes mesmo com 1 consultor", value=False, key="force_split_single")
+            leads_por_consultor = st.number_input("Número de leads por consultor", min_value=1, value=50, disabled=not force_split)
+            if not force_split:
+                st.info("Apenas 1 consultor selecionado — por padrão ele receberá todos os leads. Marque a opção para dividir em lotes.")
+        else:
+            leads_por_consultor = st.number_input("Número de leads por consultor", min_value=1, value=50)
 
         if st.button("Gerar Arquivo 'Pessoas'"):
             with st.spinner("Processando... Por favor, aguarde."):
@@ -791,27 +1132,17 @@ def aba_automacao_pessoas_agendor():
                         st.warning("Após a filtragem, não restaram leads para distribuir.")
                         return
 
-                    # Determine effective consultants based on filters
-                    effective_consultores = []
-                    if selected_teams:
-                        for team in selected_teams:
-                            effective_consultores.extend(EQUIPES.get(team, []))
-                        effective_consultores = list(set(effective_consultores))
-                    else:
-                        effective_consultores = list(CONSULTORES)
-
-                    if excluded_consultants:
-                        effective_consultores = [c for c in effective_consultores if c not in excluded_consultants]
-                    effective_consultores.sort()
-
                     if not effective_consultores:
                         st.warning("Nenhum consultor selecionado após a aplicação dos filtros. Ajuste suas seleções.")
                         return
 
-                    # Clean CEL column (now in df_leads_mapped)
+                    # Clean CEL column (apply same phone cleaning as Whats)
                     if "CEL" in df_leads_mapped.columns:
-                        df_leads_mapped["CEL"] = pd.to_numeric(df_leads_mapped["CEL"], errors='coerce')
-                        df_leads_mapped["CEL"] = df_leads_mapped["CEL"].astype('Int64').astype(str).replace('<NA>', '')
+                        # Para o campo 'Celular' preservamos todos os dígitos completos
+                        # (evita remover o primeiro dígito do DDD). Use preserve_full=True.
+                        df_leads_mapped["CEL"] = df_leads_mapped["CEL"].apply(lambda x: clean_phone_number(x, preserve_full=True))
+                        # Replace NaN with empty string for easier usage later
+                        df_leads_mapped["CEL"] = df_leads_mapped["CEL"].fillna("")
                     
                     # --- Agendor Specific Logic ---
                     # Deduplicate by WhatsApp
@@ -835,142 +1166,515 @@ def aba_automacao_pessoas_agendor():
                     leads_processados = 0
                     total_leads = len(df_leads_mapped)
 
-                    st.info(f"DEBUG: df_leads_mapped length after all filters: {len(df_leads_mapped)}")
-                    st.info(f"DEBUG: Valor de leads_por_consultor ANTES do loop de distribuição: {leads_por_consultor}")
+                    # Debug lines removed from UI for cleaner UX
 
-                    while leads_processados < total_leads:
-                        for consultor in effective_consultores:
-                            if leads_processados >= total_leads:
-                                break
+                    # If exactly one consultant is selected and the user did not request forced splitting,
+                    # create a single file containing all leads for that consultant.
+                    if len(effective_consultores) == 1 and not st.session_state.get('force_split_single', False):
+                        consultor = effective_consultores[0]
+                        dados_finais = []
+                        consultor_formatado = consultor.lower().replace(' ', '.')
+                        df_lote = df_leads_mapped.copy()
+                        for _, row in df_lote.iterrows():
+                            whatsapp_val = row.get("Whats")
+                            whatsapp_str = f"+55{str(whatsapp_val).strip()}" if whatsapp_val and pd.notna(whatsapp_val) and str(whatsapp_val).strip() else ""
+                            celular_val = row.get("CEL")
+                            celular_str = str(celular_val) if celular_val and pd.notna(celular_val) else ""
+                            descricao_val = default_descricao.strip() if default_descricao and str(default_descricao).strip() else None
+                            if not descricao_val:
+                                descricao_val = row.get("Razao Social") or row.get("Fantasia") or row.get("Empresa") or ""
+                            cep_val = ""
+                            if "CEP" in row and pd.notna(row.get("CEP")):
+                                cep_val = normalize_cep(row.get("CEP"))
+                            linha = {col: "" for col in colunas_output}
+                            linha.update({
+                                "Nome": row.get("NOME", ""),
+                                "Cargo": default_cargo,
+                                "Usuário responsável": consultor_formatado,
+                                "Categoria": "Lead",
+                                "Origem": "Reobote",
+                                "Descrição": descricao_val,
+                                "WhatsApp": whatsapp_str,
+                                "Celular": celular_str,
+                                "Estado": default_uf,
+                                "Cidade": row.get("Cidade", ""),
+                                "Bairro": row.get("Bairro", ""),
+                                "Rua": row.get("Rua", ""),
+                                "Número": row.get("Número", ""),
+                                "Complemento": row.get("Complemento", ""),
+                                "CEP": cep_val
+                            })
+                            dados_finais.append(linha)
 
-                            inicio_lote = leads_processados
-                            fim_lote = leads_processados + leads_por_consultor
-                            df_lote = df_leads_mapped.iloc[inicio_lote:fim_lote].copy()
+                        df_final_consultor = pd.DataFrame(dados_finais, columns=colunas_output)
+                        output_excel_consultor = io.BytesIO()
+                        with pd.ExcelWriter(output_excel_consultor, engine='openpyxl') as writer:
+                            df_final_consultor.to_excel(writer, index=False, sheet_name='Pessoas')
+                        output_excel_consultor.seek(0)
 
-                            if not df_lote.empty:
-                                # ... (código de preparação do df_final_consultor) ...
-                                dados_finais = []
-                                consultor_formatado = consultor.lower().replace(' ', '.')
-                                for _, row in df_lote.iterrows():
-                                        # Limpa o número e adiciona o prefixo apenas se houver um valor válido
+                        # Determine localidade for filename (safer logic)
+                        localidade = determine_localidade(user_col_mapping, df_lote, default="CG")
+
+                        nicho_formatado = nicho_valor.upper().replace(' ', '_')
+                        primeiro_nome = consultor.split(' ')[0].upper()
+                        data_formatada = datetime.now().strftime('%d-%m-%Y')
+                        # Nome do arquivo: usar apenas o nicho e o primeiro nome do consultor
+                        nome_arquivo_agendor = f"PESSOAS_{nicho_formatado}_{primeiro_nome}_{data_formatada}.xlsx"
+                        generated_files[nome_arquivo_agendor] = output_excel_consultor.getvalue()
+                        leads_processados = total_leads
+                    else:
+                        # Existing batching logic: distribute in chunks across consultants
+                        while leads_processados < total_leads:
+                            for consultor in effective_consultores:
+                                if leads_processados >= total_leads:
+                                    break
+
+                                inicio_lote = leads_processados
+                                fim_lote = leads_processados + leads_por_consultor
+                                df_lote = df_leads_mapped.iloc[inicio_lote:fim_lote].copy()
+
+                                if not df_lote.empty:
+                                    dados_finais = []
+                                    consultor_formatado = consultor.lower().replace(' ', '.')
+                                    for _, row in df_lote.iterrows():
                                         whatsapp_val = row.get("Whats")
-                                        whatsapp_str = f"+55{str(whatsapp_val).split('.')[0]}" if whatsapp_val and pd.notna(whatsapp_val) else ""
-
+                                        whatsapp_str = f"+55{str(whatsapp_val).strip()}" if whatsapp_val and pd.notna(whatsapp_val) and str(whatsapp_val).strip() else ""
                                         celular_val = row.get("CEL")
-                                        celular_str = f"+55{str(celular_val).split('.')[0]}" if celular_val and pd.notna(celular_val) else ""
-
+                                        celular_str = str(celular_val) if celular_val and pd.notna(celular_val) else ""
+                                        descricao_val = default_descricao.strip() if default_descricao and str(default_descricao).strip() else None
+                                        if not descricao_val:
+                                            descricao_val = row.get("Razao Social") or row.get("Fantasia") or row.get("Empresa") or ""
+                                        cep_val = ""
+                                        if "CEP" in row and pd.notna(row.get("CEP")):
+                                            cep_val = normalize_cep(row.get("CEP"))
                                         linha = {col: "" for col in colunas_output}
                                         linha.update({
-                                        "Nome": row.get("NOME", ""),
-                                        "Cargo": default_cargo,
-                                        "Usuário responsável": consultor_formatado,
-                                        "Categoria": "Lead",
-                                        "Origem": "Reobote",
-                                        "Descrição": default_descricao,
-                                        "WhatsApp": whatsapp_str,
-                                        "Celular": celular_str,
-                                        "Estado": default_uf,
-                                        "Cidade": row.get("Cidade", ""),
-                                        "Bairro": row.get("Bairro", ""),
-                                        "Rua": row.get("Rua", ""),
-                                        "Número": row.get("Número", ""),
-                                        "Complemento": row.get("Complemento", "")
-                                    })
+                                            "Nome": row.get("NOME", ""),
+                                            "Cargo": default_cargo,
+                                            "Usuário responsável": consultor_formatado,
+                                            "Categoria": "Lead",
+                                            "Origem": "Reobote",
+                                            "Descrição": descricao_val,
+                                            "WhatsApp": whatsapp_str,
+                                            "Celular": celular_str,
+                                            "Estado": default_uf,
+                                            "Cidade": row.get("Cidade", ""),
+                                            "Bairro": row.get("Bairro", ""),
+                                            "Rua": row.get("Rua", ""),
+                                            "Número": row.get("Número", ""),
+                                            "Complemento": row.get("Complemento", ""),
+                                            "CEP": cep_val
+                                        })
                                         dados_finais.append(linha)
-                                
-                                df_final_consultor = pd.DataFrame(dados_finais, columns=colunas_output)
 
-                                output_excel_consultor = io.BytesIO()
-                                with pd.ExcelWriter(output_excel_consultor, engine='openpyxl') as writer:
-                                    df_final_consultor.to_excel(writer, index=False, sheet_name='Pessoas')
-                                output_excel_consultor.seek(0)
+                                    df_final_consultor = pd.DataFrame(dados_finais, columns=colunas_output)
 
-                                # Lógica para determinar a localidade
-                                localidade = "CG" # Padrão
-                                cidade_col = user_col_mapping.get("Cidade")
-                                uf_col = user_col_mapping.get("UF")
-                                if cidade_col and cidade_col in df_lote.columns and not df_lote[cidade_col].empty:
-                                    cidade_val = df_lote[cidade_col].iloc[0]
-                                    if pd.notna(cidade_val) and str(cidade_val).strip():
-                                        localidade = str(cidade_val).strip().upper()
-                                elif uf_col and uf_col in df_lote.columns and not df_lote[uf_col].empty:
-                                    uf_val = df_lote[uf_col].iloc[0]
-                                    if pd.notna(uf_val) and str(uf_val).strip():
-                                        localidade = str(uf_val).strip().upper()
+                                    output_excel_consultor = io.BytesIO()
+                                    with pd.ExcelWriter(output_excel_consultor, engine='openpyxl') as writer:
+                                        df_final_consultor.to_excel(writer, index=False, sheet_name='Pessoas')
+                                    output_excel_consultor.seek(0)
 
-                                # Formata o nicho e o nome do consultor para o nome do arquivo
-                                nicho_formatado = nicho_valor.upper().replace(' ', '_')
-                                primeiro_nome = consultor.split(' ')[0].upper()
-                                data_formatada = datetime.now().strftime('%d-%m-%Y')
-                                
-                                nome_arquivo_agendor = f"PESSOAS_{nicho_formatado}_{localidade}_{primeiro_nome}_{data_formatada}.xlsx"
-                                
-                                generated_files[nome_arquivo_agendor] = output_excel_consultor.getvalue()
-                                
-                                leads_processados += len(df_lote)
+                                    # Determine localidade for filename (safer logic)
+                                    localidade = determine_localidade(user_col_mapping, df_lote, default="CG")
 
-                    # --- Lógica de Download (Inteligente) ---
+                                    nicho_formatado = nicho_valor.upper().replace(' ', '_')
+                                    primeiro_nome = consultor.split(' ')[0].upper()
+                                    data_formatada = datetime.now().strftime('%d-%m-%Y')
+                                    # Nome do arquivo: usar apenas o nicho e o primeiro nome do consultor
+                                    nome_arquivo_agendor = f"PESSOAS_{nicho_formatado}_{primeiro_nome}_{data_formatada}.xlsx"
+                                    generated_files[nome_arquivo_agendor] = output_excel_consultor.getvalue()
+                                    leads_processados += len(df_lote)
+
+                    # --- Lógica de Download e Handoff ---
                     if not generated_files:
                         st.warning("Nenhum arquivo foi gerado. Verifique os filtros e os dados de entrada.")
                         return
 
+                    # Salva os arquivos gerados no estado da sessão para o handoff
+                    st.session_state.generated_pessoas_files = generated_files
+
                     st.success(f"Processo concluído! {len(generated_files)} arquivo(s) de pessoas para Agendor foram gerados.")
 
-                    # Se for apenas um arquivo, oferece o download direto
-                    if len(generated_files) == 1:
-                        file_name, file_data = list(generated_files.items())[0]
-                        st.download_button(
-                            label=f"Baixar Arquivo para Agendor (.xlsx)",
-                            data=file_data,
-                            file_name=file_name,
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                        )
-                    # Se forem vários arquivos, agrupa em um ZIP
-                    else:
-                        zip_buffer = io.BytesIO()
-                        with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
-                            for file_name, file_data in generated_files.items():
-                                # Extrai o nome do consultor do nome do arquivo para encontrar a equipe
-                                parts = file_name.split('_')
-                                consultor_nome_no_arquivo = ""
-                                if len(parts) > 3:
-                                    consultor_nome_no_arquivo = parts[-2].upper()
+                    # Opções de Download
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        # Se for apenas um arquivo, oferece o download direto
+                        if len(generated_files) == 1:
+                            file_name, file_data = list(generated_files.items())[0]
+                            st.download_button(
+                                label=f"Baixar Arquivo para Agendor (.xlsx)",
+                                data=file_data,
+                                file_name=file_name,
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                key="download_single_agendor"
+                            )
+                        # Se forem vários arquivos, agrupa em um ZIP
+                        else:
+                            zip_buffer = io.BytesIO()
+                            with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
+                                for file_name, file_data in generated_files.items():
+                                    # Extrai o nome do consultor do nome do arquivo para encontrar a equipe
+                                    parts = file_name.split('_')
+                                    consultor_nome_no_arquivo = ""
+                                    if len(parts) > 3:
+                                        consultor_nome_no_arquivo = parts[-2].upper()
 
-                                nome_equipe = "Outros" # Padrão
-                                for consultor_lista, equipe in CONSULTOR_PARA_EQUIPE.items():
-                                    if consultor_lista.split(' ')[0].upper() == consultor_nome_no_arquivo:
-                                        nome_equipe = equipe
-                                        break
-                                zip_file.writestr(f"{nome_equipe}/{file_name}", file_data)
-                        
-                        zip_filename = f"Pessoas_Agendor_Distribuicao_{datetime.now().strftime('%d-%m-%Y')}.zip"
-                        st.download_button(
-                            label="Baixar Todos os Arquivos para Agendor (ZIP)",
-                            data=zip_buffer.getvalue(),
-                            file_name=zip_filename,
-                            mime="application/zip"
-                        )
+                                    nome_equipe = "Outros" # Padrão
+                                    # Buscar equipe do consultor via JSON
+                                    for equipe in carregar_equipes():
+                                        for consultor in equipe["consultores"]:
+                                            if consultor.split(' ')[0].upper() == consultor_nome_no_arquivo:
+                                                nome_equipe = equipe["nome"]
+                                                break
+                                    zip_file.writestr(f"{nome_equipe}/{file_name}", file_data)
+                            
+                            zip_filename = f"Pessoas_Agendor_Distribuicao_{datetime.now().strftime('%d-%m-%Y')}.zip"
+                            st.download_button(
+                                label="Baixar Todos os Arquivos (ZIP)",
+                                data=zip_buffer.getvalue(),
+                                file_name=zip_filename,
+                                mime="application/zip",
+                                key="download_zip_agendor"
+                            )
+                    
+                    # Botão para Handoff
+                    with col2:
+                        if st.session_state.get('generated_pessoas_files') and st.button("Continuar e Gerar Negócios ➡️"):
+                            st.session_state.handoff_active = True
+                            st.session_state.source_for_negocios = 'handoff'
+                            # Mensagens para guiar o usuário em vez de rerun
+                            st.success("✅ Leads prontos para a próxima etapa!")
+                            st.info("ℹ️ Agora, clique na aba 'Gerador de Negócios para Robôs' para gerar os arquivos de negócios.")
 
                 except Exception as e:
                     st.error(f"Ocorreu um erro durante o processamento: {e}")
 
 
+# Note: `carregar_consultores` / `salvar_consultores` and `CONSULTORES_FILE`
+# are defined earlier in the module. Duplicate definitions were removed to
+# avoid confusion and accidental redefinition.
+
+def aba_gerenciar_consultores():
+    st.header("Gerenciar Consultores")
+    consultores = carregar_consultores()
+    equipes = carregar_equipes()
+
+
+
+
+    # Formulário para adicionar novo consultor (só mostra se não está editando)
+    if "edit_idx" not in st.session_state:
+        st.subheader("Adicionar novo consultor")
+        with st.form("add_consultor_form"):
+            novo_usuario = st.text_input("Nome de usuário do consultor")
+            novo_consultor = st.text_input("Nome do consultor (exibição)")
+            submitted_add = st.form_submit_button("Adicionar consultor")
+            if submitted_add:
+                try:
+                    if not novo_usuario.strip() or not novo_consultor.strip():
+                        st.warning("Preencha todos os campos para adicionar um consultor.")
+                    elif any(c["usuario"] == novo_usuario and c["consultor"] == novo_consultor for c in consultores):
+                        st.warning("Já existe um consultor com esse usuário e nome.")
+                    else:
+                        consultores.append({"usuario": novo_usuario, "consultor": novo_consultor})
+                        salvar_consultores(consultores)
+                        st.success(f"Consultor '{novo_consultor}' adicionado!")
+                        try:
+                            st.rerun()
+                        except AttributeError:
+                            st.warning("Não foi possível recarregar a página automaticamente. Atualize manualmente.")
+                except Exception as e:
+                    st.error(f"Erro ao adicionar consultor: {e}")
+
+    # Expander deve ficar aberto se estiver editando
+    expanded_consultores = "edit_idx" in st.session_state
+
+    with st.expander("Lista de consultores cadastrados", expanded=expanded_consultores):
+        if consultores:
+            for idx, c in enumerate(consultores):
+                unique_id = f"{c['usuario']}__{c['consultor']}__{idx}"
+                if "edit_idx" in st.session_state and st.session_state["edit_idx"] == idx:
+                    # Modo edição inline
+                    st.markdown(f"**Editando consultor {c['consultor']} (usuário: {c['usuario']})**")
+                    with st.form(f"edit_consultor_form_{idx}"):
+                        novo_usuario = st.text_input("Nome de usuário", value=st.session_state["edit_usuario"])
+                        novo_consultor = st.text_input("Nome do consultor (exibição)", value=st.session_state["edit_consultor"])
+                        colsave, colcancel = st.columns([2,2])
+                        with colsave:
+                            submitted_edit = st.form_submit_button("Salvar alterações")
+                        with colcancel:
+                            cancel_edit = st.form_submit_button("Cancelar")
+                        if submitted_edit:
+                            try:
+                                if not novo_usuario.strip() or not novo_consultor.strip():
+                                    st.warning("Preencha todos os campos para editar o consultor.")
+                                elif any(i != st.session_state["edit_idx"] and c["usuario"] == novo_usuario and c["consultor"] == novo_consultor for i, c in enumerate(consultores)):
+                                    st.warning("Já existe um consultor com esse usuário e nome.")
+                                else:
+                                    idx = st.session_state["edit_idx"]
+                                    antigo_nome = consultores[idx]["consultor"]
+                                    consultores[idx] = {"usuario": novo_usuario, "consultor": novo_consultor}
+                                    salvar_consultores(consultores)
+                                    for equipe in equipes:
+                                        if antigo_nome in equipe["consultores"]:
+                                            equipe["consultores"].remove(antigo_nome)
+                                            equipe["consultores"].append(novo_consultor)
+                                    salvar_equipes(equipes)
+                                    st.success("Consultor atualizado!")
+                                    del st.session_state["edit_idx"]
+                                    del st.session_state["edit_usuario"]
+                                    del st.session_state["edit_consultor"]
+                                    try:
+                                        st.rerun()
+                                    except AttributeError:
+                                        st.warning("Não foi possível recarregar a página automaticamente. Atualize manualmente.")
+                            except Exception as e:
+                                st.error(f"Erro ao editar consultor: {e}")
+                        if cancel_edit:
+                            del st.session_state["edit_idx"]
+                            del st.session_state["edit_usuario"]
+                            del st.session_state["edit_consultor"]
+                            try:
+                                st.rerun()
+                            except AttributeError:
+                                st.warning("Não foi possível recarregar a página automaticamente. Atualize manualmente.")
+                else:
+                    col1, col2, col3 = st.columns([4, 3, 2])
+                    with col1:
+                        st.write(f"{idx+1}. {c['consultor']} (usuário: {c['usuario']})")
+                    with col2:
+                        if st.button("Editar", key=f"edit_{unique_id}"):
+                            st.session_state["edit_idx"] = idx
+                            st.session_state["edit_usuario"] = c["usuario"]
+                            st.session_state["edit_consultor"] = c["consultor"]
+                            st.session_state["abrir_expander_consultores"] = True
+                            try:
+                                st.rerun()
+                            except AttributeError:
+                                st.warning("Não foi possível recarregar a página automaticamente. Atualize manualmente.")
+                    with col3:
+                        if st.button("Excluir", key=f"delete_{unique_id}"):
+                            try:
+                                consultores.pop(idx)
+                                salvar_consultores(consultores)
+                                for equipe in equipes:
+                                    if c["consultor"] in equipe["consultores"]:
+                                        equipe["consultores"].remove(c["consultor"])
+                                salvar_equipes(equipes)
+                                st.success("Consultor excluído!")
+                                try:
+                                    st.rerun()
+                                except AttributeError:
+                                    st.warning("Não foi possível recarregar a página automaticamente. Atualize manualmente.")
+                            except Exception as e:
+                                st.error(f"Erro ao excluir consultor: {e}")
+        else:
+            st.info("Nenhum consultor cadastrado ainda.")
+
+
+    st.markdown("---")
+    with st.expander("Gerenciar Equipes", expanded=False):
+        equipes = carregar_equipes()
+        with st.form("add_equipe_form"):
+            nome_equipe = st.text_input("Nome da equipe")
+            submitted_equipe = st.form_submit_button("Adicionar equipe")
+            if submitted_equipe and nome_equipe:
+                try:
+                    if not any(eq["nome"] == nome_equipe for eq in equipes):
+                        equipes.append({"nome": nome_equipe, "consultores": []})
+                        salvar_equipes(equipes)
+                        st.success(f"Equipe '{nome_equipe}' adicionada!")
+                        try:
+                            st.rerun()
+                        except AttributeError:
+                            st.warning("Não foi possível recarregar a página automaticamente. Atualize manualmente.")
+                    else:
+                        st.warning("Já existe uma equipe com esse nome.")
+                except Exception as e:
+                    st.error(f"Erro ao adicionar equipe: {e}")
+
+        for idx, equipe in enumerate(equipes):
+            st.subheader(f"Equipe: {equipe['nome']}")
+            consultores_nomes = [c["consultor"] for c in consultores]
+            consultores_na_equipe = equipe["consultores"]
+            consultores_disponiveis = [c for c in consultores_nomes if c not in consultores_na_equipe]
+            add_col, del_col, edit_col = st.columns([4,2,2])
+            with add_col:
+                novo_consultor = st.selectbox(f"Adicionar consultor à {equipe['nome']}", ["-- Selecione --"] + consultores_disponiveis, key=f"add_consultor_{idx}")
+                if novo_consultor != "-- Selecione --" and st.button(f"Adicionar à {equipe['nome']}", key=f"btn_add_consultor_{idx}"):
+                    try:
+                        equipe["consultores"].append(novo_consultor)
+                        salvar_equipes(equipes)
+                        st.success(f"Consultor '{novo_consultor}' adicionado à equipe '{equipe['nome']}'!")
+                        try:
+                            st.rerun()
+                        except AttributeError:
+                            st.warning("Não foi possível recarregar a página automaticamente. Atualize manualmente.")
+                    except Exception as e:
+                        st.error(f"Erro ao adicionar consultor à equipe: {e}")
+            with del_col:
+                if st.button(f"Excluir equipe", key=f"delete_equipe_{idx}"):
+                    try:
+                        equipes.pop(idx)
+                        salvar_equipes(equipes)
+                        st.success("Equipe excluída!")
+                        try:
+                            st.rerun()
+                        except AttributeError:
+                            st.warning("Não foi possível recarregar a página automaticamente. Atualize manualmente.")
+                    except Exception as e:
+                        st.error(f"Erro ao excluir equipe: {e}")
+            with edit_col:
+                if st.button(f"Renomear equipe", key=f"rename_equipe_{idx}"):
+                    st.session_state["edit_equipe_idx"] = idx
+                    st.session_state["edit_equipe_nome"] = equipe["nome"]
+            st.write("**Consultores na equipe:**")
+            for cidx, nome_c in enumerate(equipe["consultores"]):
+                ccol1, ccol2 = st.columns([6,2])
+                with ccol1:
+                    st.write(f"- {nome_c}")
+                with ccol2:
+                    if st.button(f"Remover", key=f"remover_{idx}_{cidx}"):
+                        try:
+                            equipe["consultores"].remove(nome_c)
+                            salvar_equipes(equipes)
+                            st.success(f"Consultor '{nome_c}' removido da equipe '{equipe['nome']}'!")
+                            try:
+                                st.rerun()
+                            except AttributeError:
+                                st.warning("Não foi possível recarregar a página automaticamente. Atualize manualmente.")
+                        except Exception as e:
+                            st.error(f"Erro ao remover consultor da equipe: {e}")
+            if "edit_equipe_idx" in st.session_state and st.session_state["edit_equipe_idx"] == idx:
+                with st.form(f"form_rename_equipe_{idx}"):
+                    novo_nome = st.text_input("Novo nome da equipe", value=st.session_state["edit_equipe_nome"])
+                    submitted_rename = st.form_submit_button("Salvar nome")
+                    if submitted_rename and novo_nome:
+                        try:
+                            equipes[idx]["nome"] = novo_nome
+                            salvar_equipes(equipes)
+                            st.success("Nome da equipe atualizado!")
+                            del st.session_state["edit_equipe_idx"]
+                            del st.session_state["edit_equipe_nome"]
+                            st.experimental_rerun()
+                        except Exception as e:
+                            st.error(f"Erro ao renomear equipe: {e}")
+
+
 def main():
-    st.title("Automação de Listas")
+    st.set_page_config(page_title="Automação de Listas", layout="wide")
 
-    tabs = st.tabs(["Higienização de Dados", "Divisor de Listas Diárias", "Robos Lista Automoveis", "Automação Pessoas Agendor"])
+    # Header (minimal)
+    st.markdown(
+        """
+        <div style='display:flex;align-items:center;gap:12px'>
+          <div style='width:44px;height:44px;border-radius:8px;background:#4B8BBE;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700'>A</div>
+          <div>
+            <div style='font-size:20px;font-weight:600;color:#e6eef8'>Automação de Listas</div>
+            <div style='font-size:12px;color:#94a3b8'>Minimal · elegante · eficiente</div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    with tabs[0]:
+    # Global dark theme CSS (visual only)
+    st.markdown(
+        """
+        <style>
+          /* Hide default bits */
+          #MainMenu {visibility: hidden;}
+          footer {visibility: hidden;}
+
+          /* App background and text */
+          [data-testid="stAppViewContainer"] {
+            background: linear-gradient(180deg,#071226 0%, #07122a 100%);
+            color: #e6eef8;
+          }
+
+          /* Sidebar styling */
+          section[data-testid="stSidebar"] {
+            background: linear-gradient(180deg,#061224 0%, #071226 100%);
+            border-right: 1px solid rgba(255,255,255,0.03);
+            padding-top: 10px;
+          }
+          section[data-testid="stSidebar"] .css-1d391kg, section[data-testid="stSidebar"] .css-1lcbmhc {
+            color: #cbd5e1;
+          }
+
+          /* Option menu overrides (streamlit_option_menu classes) */
+          .option-menu { background: transparent !important; }
+          .option-menu .nav-link { color: #cbd5e1 !important; }
+          .option-menu .nav-link:hover { background: rgba(255,255,255,0.02) !important; }
+          .option-menu .nav-link-selected { background: #12324a !important; color: #e6eef8 !important; font-weight:600 !important; box-shadow: 0 6px 18px rgba(12,44,66,0.35) !important; }
+
+          /* Info / Alert boxes look like glass cards */
+          .stAlert, .css-1tq5r2k { background: rgba(255,255,255,0.02) !important; border: 1px solid rgba(255,255,255,0.03) !important; color: #dbeafe !important; border-radius: 10px !important; padding: 10px 14px !important; }
+
+          /* File uploader and input controls */
+          .stFileUploader, .css-1hynsf2, .css-1y4p8pa { background: rgba(255,255,255,0.02) !important; border: 1px solid rgba(255,255,255,0.03) !important; border-radius: 10px !important; padding: 12px !important; }
+
+          /* Buttons */
+          .stButton>button {
+            background: linear-gradient(90deg,#4B8BBE,#3B82F6) !important;
+            color:#fff !important;
+            border-radius:8px !important;
+            padding:8px 14px !important;
+            border: none !important;
+            box-shadow: 0 6px 18px rgba(59,130,246,0.12) !important;
+          }
+          .stButton>button:hover { transform: translateY(-1px); }
+
+          /* Dataframe / tables */
+          [data-testid="stDataFrame"] { background: rgba(255,255,255,0.02); border-radius:8px; padding:8px; }
+
+          /* Muted text */
+          .muted, small { color:#94a3b8; }
+
+          /* Headings */
+          .css-2trqyj h1, .css-2trqyj h2, h1, h2, h3 { color:#e6eef8; font-weight:600; }
+
+          /* Make controls slightly higher contrast */
+          .stSelectbox > div[role="combobox"] { background: rgba(255,255,255,0.01) !important; border-radius:8px !important; padding:6px 8px !important; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Sidebar navigation
+    if "sidebar_open" not in st.session_state:
+        st.session_state.sidebar_open = True
+
+    with st.sidebar:
+        st.markdown("<div style='padding:8px 6px'><strong style='font-size:14px'>Navegação</strong></div>", unsafe_allow_html=True)
+        selected = option_menu(
+            "Navegação",
+            ["Higienização de dados", "Divisor de Listas Diárias - Auto", "Gerador de Negócios para Robôs", "Automação Pessoas Agendor", "Gerenciar Consultores/Equipes"],
+            icons=["list-task", "columns-gap", "robot", "people", "person-lines-fill"],
+            menu_icon="cast",
+            default_index=0,
+            styles={
+                "container": {"padding": "4px 2px", "background-color": "#ffffff00"},
+                "icon": {"color": "#6b7280", "font-size": "18px"},
+                "nav-link": {"font-size": "14px", "text-align": "left", "margin": "4px 0px", "color": "#cbd5e1", "background-color": "transparent", "border-radius": "6px", "height": "44px", "display": "flex", "align-items": "center", "padding-left": "8px"},
+                "nav-link-selected": {"background-color": "#12324a", "color": "#e6eef8", "font-weight": "600"},
+            }
+        )
+        page = selected
+
+    # Page routing (no logic changes)
+    if page == "Higienização de dados":
         aba_higienizacao()
-
-    with tabs[1]:
+    elif page == "Divisor de Listas Diárias - Auto":
         aba_divisor_listas()
-    
-    with tabs[2]:
+    elif page == "Gerador de Negócios para Robôs":
         aba_gerador_negocios_robos()
-
-    with tabs[3]:
+    elif page == "Automação Pessoas Agendor":
         aba_automacao_pessoas_agendor()
+    elif page == "Gerenciar Consultores/Equipes":
+        aba_gerenciar_consultores()
+
+    # (Removed duplicate sidebar block and duplicate page routing to avoid rendering pages twice.)
 
 if __name__ == "__main__":
     main()
