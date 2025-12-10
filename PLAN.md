@@ -70,38 +70,46 @@ Esta é a nova funcionalidade implementada.
 *   **Nome do Arquivo:** O formato do nome do arquivo é `PESSOAS_{NICHO}_{LOCALIDADE}_{CONSULTOR}_{DATA}.xlsx`.
 *   **Saída:** Arquivos Excel "Pessoas" (individualmente ou em ZIP se múltiplos).
 
-### 3.4. Aba "Gerador de Negócios para Robôs" (NOVA FUNCIONALIDADE)
+### 3.4. Aba "Gerador de Negócios para Robôs" (Fluxo Inteligente)
 
-*   **Propósito:** Gerar arquivos Excel no formato "Negócios" para importação em sistemas de robôs, utilizando os leads já processados e distribuídos nos arquivos "Pessoas Agendor".
-*   **Entrada:** Os arquivos Excel de "Pessoas Agendor" gerados pela aba "Automação Pessoas Agendor".
-*   **Configuração do Usuário:**
-    *   **Número de Negócios por Consultor:** O usuário definirá quantos leads (negócios) cada arquivo de negócio deve conter.
-    *   **Data de Início:** O usuário definirá a data de início para a primeira planilha de negócios. As datas subsequentes serão incrementadas automaticamente, pulando finais de semana.
-    *   **Nicho:** O usuário fornecerá o nicho (ex: AUTO, MED, ADV) que será usado na formatação do "Título do negócio".
-*   **Colunas da Planilha de Negócios:**
-    *   `Título do negócio`: Formato `MM/YY - RB - NICHO - NOME_PESSOA/ESPs`
-    *   `Empresa relacionada`: Será deixada em branco.
-    *   `Pessoa relacionada`: Preenchido com o `Nome` do lead do arquivo de Pessoas.
-    *   `Usuário responsável`: Preenchido com o `Usuário responsável` do lead do arquivo de Pessoas.
-    *   `Data de início`: Data definida pelo usuário, incrementada para arquivos subsequentes.
-    *   `Data de conclusão`: Preenchido temporariamente com o número de WhatsApp do lead (como texto).
-    *   `Valor Total`: Será deixada em branco.
-    *   `Funil`: "Funil de Vendas" (valor fixo)
-    *   `Etapa`: "Prospecção" (valor fixo)
-    *   `Status`: "Em andamento" (valor fixo)
-    *   `Motivo de perda`: Será deixada em branco.
-    *   `Descrição do motivo de perda`: Será deixada em branco.
-    *   `Ranking`: Será deixada em branco.
-    *   `Descrição`: Será deixada em branco.
-    *   `Produtos e Serviços`: Será deixada em branco.
-*   **Processamento:**
-    *   O script lerá os leads de cada arquivo "Pessoas Agendor" (um por consultor).
-    *   Dividirá os leads em lotes com base no "Número de Negócios por Consultor" especificado.
-    *   Para cada lote, um novo arquivo Excel de "Negócios" será gerado.
-*   **Lógica de Data:**
-    *   A coluna de data nos arquivos de "Negócios" será preenchida automaticamente.
-    *   Para cada arquivo de negócio gerado para o *mesmo consultor*, a data será incrementada, pulando sábados e domingos.
-*   **Saída:** Os arquivos Excel de "Negócios" gerados serão salvos na mesma pasta do arquivo de "Pessoas Agendor" correspondente.
+Esta aba foi redesenhada para ser o centro da geração de arquivos de "Negócios", operando em dois modos inteligentes para máxima flexibilidade e eficiência do usuário.
+
+#### Modo 1: Fluxo de Trabalho Contínuo (Handoff)
+
+Este é o "caminho dourado" para o usuário, projetado para ser rápido e intuitivo.
+
+*   **Gatilho:** Ocorre quando o usuário, após gerar os arquivos na aba **"Automação Pessoas Agendor"**, clica no novo botão **`[Continuar e Gerar Negócios]`**.
+*   **Mecanismo:**
+    1.  Os arquivos "Pessoas" recém-gerados são mantidos em memória (`st.session_state`).
+    2.  Uma flag (`handoff_active`) é ativada no estado da sessão.
+    3.  O usuário é visualmente guiado (ou instruído) a ir para a aba "Gerador de Negócios".
+*   **Interface Simplificada:** Ao detectar a flag `handoff_active`, a aba apresenta uma interface mínima:
+    *   **Nenhum upload de arquivo é solicitado.**
+    *   **Nenhum mapeamento de colunas ou distribuição de consultores é necessário**, pois essas informações já vêm dos arquivos "Pessoas".
+    *   Apenas as configurações específicas de "Negócios" são exibidas:
+        *   Número de negócios por consultor.
+        *   Data de início.
+        *   Nicho para o título.
+*   **Saída:** Gera um arquivo ZIP com os arquivos de "Negócios" correspondentes. A flag `handoff_active` é desativada após o uso.
+
+#### Modo 2: Processamento de Arquivo "Cru" (Avulso)
+
+Este é o modo padrão da aba, focado em processar listas de leads que ainda não foram formatadas ou atribuídas.
+
+*   **Gatilho:** Ocorre quando o usuário acessa a aba diretamente (sem o handoff) e faz o upload de um arquivo (`.xlsx` ou `.csv`).
+*   **Interface Completa:**
+    *   **Upload:** Um campo `st.file_uploader` permite o envio de um arquivo.
+    *   **Mapeamento de Colunas:** O sistema solicita o mapeamento das colunas essenciais:
+        *   `Nome` (obrigatório)
+        *   `WhatsApp` (obrigatório para a geração do "Negócio")
+    *   **Distribuição de Consultores:** Uma nova seção robusta permite ao usuário definir como os leads serão distribuídos:
+        *   **Distribuir para Todos:** Divide os leads entre todos os consultores cadastrados.
+        *   **Distribuir para Todos, EXCETO:** Apresenta um seletor múltiplo para **excluir** equipes ou consultores específicos da distribuição.
+        *   **Distribuir APENAS para:** Apresenta um seletor múltiplo para **incluir** apenas equipes ou consultores específicos.
+    *   **Configurações de Negócio:** As mesmas configurações do modo Handoff (lotes, data, nicho) são exibidas.
+*   **Saída:** Gera um arquivo ZIP com os arquivos de "Negócios" após aplicar a lógica de distribuição e formatação.
+
+---
 
 ## 4. Funções Chave e Módulos
 
@@ -183,3 +191,21 @@ Esta seção documenta os erros encontrados durante o desenvolvimento, suas caus
 #### Erro: PDF Gerado em Branco (Reincidente)
 - **Causa:** Após correções anteriores, os PDFs da aba "Divisor de Listas" voltaram a ser gerados em branco. A causa provável é um erro na lógica de cálculo de largura das colunas (`col_widths`) em `create_pdf.py`, que pode não estar atribuindo uma largura a todas as colunas, fazendo com que a renderização da tabela falhe silenciosamente.
 - [ ] **Alternativa 1:** Simplificar a lógica de cálculo de largura das colunas em `create_pdf_robust` para garantir que todas as colunas recebam um valor de largura válido, evitando a falha na renderização.
+
+### Novos Tratamentos de Erro (Fluxo Inteligente)
+
+#### Erro: Usuário clica em "Gerar Negócios" sem ter gerado "Pessoas" antes
+- **Causa:** O usuário pode tentar usar o fluxo de handoff sem ter os dados necessários no `st.session_state`.
+- [x] **Solução:** O botão `[Continuar e Gerar Negócios]` na aba "Pessoas Agendor" só ficará visível e ativo **após** a geração bem-sucedida dos arquivos de "Pessoas". Isso impede o acionamento do fluxo sem os dados pré-carregados.
+
+#### Erro: Arquivo "Cru" sem colunas essenciais
+- **Causa:** O usuário faz upload de um arquivo no modo "Arquivo Cru" que não contém colunas que possam ser mapeadas para `Nome` ou `WhatsApp`.
+- [x] **Solução:** O botão "Gerar Arquivos de Negócios" ficará desativado até que o usuário mapeie explicitamente as colunas `Nome` e `WhatsApp`. Uma mensagem clara (`st.warning`) será exibida se o mapeamento não for satisfeito, guiando o usuário.
+
+#### Erro: Nenhum consultor selecionado para distribuição
+- **Causa:** No modo "Arquivo Cru", o usuário seleciona "Distribuir APENAS para" mas não escolhe nenhum consultor, ou seleciona "Distribuir para Todos, EXCETO" e acaba excluindo todos.
+- [x] **Solução:** Antes de iniciar a geração, o script verificará se a lista final de `effective_consultores` está vazia. Se estiver, uma mensagem de erro (`st.error`) será exibida, informando "Nenhum consultor selecionado para a distribuição. Ajuste os filtros.", e o processamento será interrompido.
+
+#### Erro: Estado da sessão inconsistente
+- **Causa:** O usuário pode navegar entre as abas, gerando um estado confuso (ex: gerou pessoas, foi para outra aba, voltou). A flag `handoff_active` pode permanecer ativa indevidamente.
+- [x] **Solução:** A flag `handoff_active` será explicitamente definida como `False` ou removida do `st.session_state` assim que o processo de geração de negócios for concluído ou se o usuário iniciar uma nova ação na aba (como fazer um novo upload), garantindo que a aba sempre inicie em um estado limpo e previsível.

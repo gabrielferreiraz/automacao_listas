@@ -72,7 +72,7 @@ def create_pdf_robust(df, title="Relatório", cols_to_center=None, cols_single_c
         "NOME": 75, "Whats": 30, "CEL": 30, "1º Contato": 22, "2º Contato": 22,
         "3º Contato": 22, "Atend. Lig.(S/N)": 33, "Visita Marc.(S/N)": 33,
         "Numero": 15,      # Largura reduzida
-        "UF": 10,            # Largura reduzida
+        "UF": 12,            # Largura aumentada
         "Logradouro": 40,  # Largura aumentada
         "SOCIO1Nome": 50,  # Largura ajustada para nomes de sócios
         "Razao": 60,       # Largura aumentada
@@ -133,10 +133,8 @@ def create_pdf_robust(df, title="Relatório", cols_to_center=None, cols_single_c
             if pdf.get_string_width(cell_text) > col_width - 4: # Mais margem
                 while pdf.get_string_width(cell_text) > col_width - 4:
                     cell_text = cell_text[:-1]
-                if len(cell_text) > 3:
-                    cell_text = cell_text[:-3] + '...'
 
-            pdf.cell(col_width, 6, cell_text, 1, 0, 'C', fill) # Altura do corpo reduzida
+            pdf.cell(col_width, 6, cell_text, 1, 0, 'L', fill) # Alinhamento à esquerda
         pdf.ln()
     
     # --- GERAÇÃO DE SAÍDA ROBUSTA (VIA ARQUIVO TEMPORÁRIO) ---

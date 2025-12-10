@@ -1,0 +1,15 @@
+[Unit]
+Description=Streamlit app: Automação de Listas
+After=network.target
+
+[Service]
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/automacao_de_listas
+Environment="PATH=/opt/automacao_de_listas/.venv/bin"
+ExecStart=/opt/automacao_de_listas/.venv/bin/streamlit run report_generator.py --server.port=8501 --server.enableCORS=false
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

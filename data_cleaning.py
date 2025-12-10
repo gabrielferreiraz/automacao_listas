@@ -3,18 +3,6 @@ import unicodedata
 import logging
 import numpy as np
 
-# Colunas essenciais para a estrutura Assertiva
-ASSERTIVA_ESSENTIAL_COLS = [
-    "Razao", "Fantasia", "Logradouro", "Numero", "Bairro", "Cidade", "UF",
-    "SOCIO1Nome", "SOCIO1Celular1", "SOCIO1Celular2", "CNPJ"
-]
-
-# Colunas essenciais para a estrutura Lemit
-LEMIT_ESSENTIAL_COLS = [
-    "CPF/CNPJ", "NOME/RAZAO_SOCIAL", "EMPRESAS_ASSOCIADAS", "Endereco", "Numero", "BAIRRO", "CIDADE", "UF",
-    "DDD1", "CELULAR1", "DDD2", "CELULAR2"
-]
-
 # Ordem final das colunas de saída
 FIXED_OUTPUT_ORDER = [
     "Razao", "Logradouro", "Numero", "Bairro", "Cidade", "UF",
@@ -39,14 +27,42 @@ def map_essential_columns(df, essential_cols):
 def _clean_phone_number(number_str):
     """Limpa e valida um número de telefone, retornando NaN se inválido."""
     if pd.isna(number_str) or number_str == '':
-        return np.nan
+        return ""
     cleaned = ''.join(filter(str.isdigit, str(number_str)))
-    # Considera um número inválido se tiver menos de 8 dígitos (ex: só DDD ou número incompleto)
-    if len(cleaned) < 8:
-        return np.nan
     return cleaned
 
-def identify_structure(df):
+def _format_phone_with_ddd(phone_str, include_country_code=False):
+    """Formata um número de telefone limpo com DDD e opcionalmente +55."""
+    if pd.isna(phone_str) or not isinstance(phone_str, str):
+        return np.nan
+    cleaned = ''.join(filter(str.isdigit, phone_str))
+    if len(cleaned) < 10: # Mínimo 2 dígitos para DDD + 8 para o número
+        return np.nan
+
+    ddd = cleaned[:2]
+    number = cleaned[2:]
+
+    # Formata a parte do número: XXXXX-XXXX (9 dígitos) ou XXXX-XXXX (8 dígitos)
+    if len(number) == 9:
+        formatted_number = f"{number[:5]}-{number[5:]}"
+    elif len(number) == 8:
+        formatted_number = f"{number[:4]}-{number[4:]}"
+    else:
+        return np.nan # Caso o número não tenha 8 ou 9 dígitos após o DDD
+
+    if include_country_code:
+        return f"+55 {ddd} {formatted_number}"
+    else:
+        return f"{ddd} {formatted_number}"
+
+def _is_valid_cpf(cpf_str):
+    """Valida se a string é um CPF de 11 dígitos (apenas números)."""
+    if pd.isna(cpf_str) or not isinstance(cpf_str, str):
+        return False
+    cleaned = ''.join(filter(str.isdigit, cpf_str))
+    return len(cleaned) == 11
+
+def identify_structure(df, ASSERTIVA_ESSENTIAL_COLS, LEMIT_ESSENTIAL_COLS):
     """Identifica a estrutura do DataFrame (Assertiva ou Lemit)."""
     norm_cols = {normalize_colname(col) for col in df.columns}
     
@@ -60,136 +76,272 @@ def identify_structure(df):
     else:
         return "Assertiva"
 
-def clean_and_filter_data(df, distancia_padrao="100 km"):
+def clean_and_filter_data(df, essential_cols, distancia_padrao="100 km"):
     if df.empty:
         logging.warning("DataFrame de entrada está vazio.")
-        return df, [], "Unknown"
+        print("DEBUG: clean_and_filter_data returning (empty df, empty missing, Unknown structure) - df.empty path")
+        return pd.DataFrame(), [], "Unknown"
 
-    structure = identify_structure(df)
-    logging.info(f"Estrutura de dados identificada: {structure}")
+    # A estrutura agora é passada como argumento ou detectada em load_data
+    # Removendo a chamada identify_structure(df) daqui
+    # structure = identify_structure(df)
+    # logging.info(f"Estrutura de dados identificada: {structure}")
 
-    if structure == "Assertiva":
-        essential_cols = ASSERTIVA_ESSENTIAL_COLS
-        col_map = map_essential_columns(df, essential_cols)
+    df_processed = pd.DataFrame()
+
+    # Mapeamento de nomes padrão para possíveis nomes de colunas de origem
+    MAPPING = {
+        "Razao": ["Razao", "RAZAO_SOCIAL", "NOME/RAZAO_SOCIAL", "Fantasia"],
+        "SOCIO1Nome": ["SOCIO1Nome", "NOME"],
+        "Logradouro": ["Logradouro", "FULL_LOGRADOURO", "Endereco", "ENDERECO_COMPLETO"],
+        "Numero": ["Numero", "NUMERO"],
+        "Bairro": ["Bairro", "BAIRRO"],
+        "Cidade": ["Cidade", "CIDADE"],
+        "UF": ["UF", "ESTADO"],
+        "CNPJ": ["CNPJ", "CPF/CNPJ"],
+        "Whats": ["Whats", "WhatsApp", "Telefone", "Celular", "Contato"],
+        "CEL": ["CEL", "Celular", "Telefone", "Whats", "WhatsApp"],
+        "DDD": ["DDD", "TELEFONE_DDD", "FONE_DDD"],
+        "FONE": ["FONE", "TELEFONE_NUMERO", "FONE_NUMERO", "NUMERO_TELEFONE"]
+    }
+
+    # Constrói o DataFrame processado de forma segura, coluna por coluna
+    for std_col in essential_cols:
+        source_options = MAPPING.get(std_col, [std_col]) # Usa o nome da coluna essencial como fallback
+        found_valid_col = False
         
-        if "Razao" not in col_map and "Fantasia" in col_map:
-            df.rename(columns={col_map["Fantasia"]: "Razao"}, inplace=True)
-            col_map = map_essential_columns(df, essential_cols)
-
-    elif structure == "Lemit":
-        essential_cols = LEMIT_ESSENTIAL_COLS
-        col_map = map_essential_columns(df, essential_cols)
-
-        df_standard = pd.DataFrame()
-
-        if "EMPRESAS_ASSOCIADAS" in col_map:
-            df_standard["Razao"] = df[col_map["EMPRESAS_ASSOCIADAS"]].fillna('').astype(str)
+        # Para colunas como Logradouro, Numero, Bairro, Cidade, UF, procure por variações com sufixos numéricos
+        potential_source_cols = []
+        if std_col == "Logradouro":
+            potential_source_cols = [col for col in ["Logradouro", "FULL-LOGRADOURO", "Logradouro.1", "FULL-LOGRADOURO.1", "Logradouro.2", "FULL-LOGRADOURO.2", "Logradouro.3", "FULL-LOGRADOURO.3"] if col in df.columns]
+        elif std_col == "Numero":
+            potential_source_cols = [col for col in ["NUMERO", "NUMERO.1", "NUMERO.2", "NUMERO.3"] if col in df.columns]
+        elif std_col == "Bairro":
+            potential_source_cols = [col for col in ["BAIRRO", "BAIRRO.1", "BAIRRO.2", "BAIRRO.3"] if col in df.columns]
+        elif std_col == "Cidade":
+            potential_source_cols = [col for col in ["CIDADE", "CIDADE.1", "CIDADE.2", "CIDADE.3"] if col in df.columns]
+        elif std_col == "UF":
+            potential_source_cols = [col for col in ["UF", "UF.1", "UF.2", "UF.3"] if col in df.columns]
         else:
-            df_standard["Razao"] = ''
+            potential_source_cols = [col for col in source_options if col in df.columns]
 
-        if "NOME/RAZAO_SOCIAL" in col_map:
-            df_standard["SOCIO1Nome"] = df[col_map["NOME/RAZAO_SOCIAL"]].fillna('').astype(str)
-        else:
-            df_standard["SOCIO1Nome"] = ''
+        # Ensure the order is maintained (base first, then numbered)
+        potential_source_cols.sort(key=lambda x: (len(x), x))
 
-        ddd1_col = col_map.get("DDD1")
-        cel1_col = col_map.get("CELULAR1")
-        if ddd1_col and cel1_col and ddd1_col in df.columns and cel1_col in df.columns:
-            ddd1_series = pd.to_numeric(df[ddd1_col], errors='coerce').fillna(0).astype(int).astype(str)
-            cel1_series = pd.to_numeric(df[cel1_col], errors='coerce').fillna(0).astype(int).astype(str)
-            df_standard["SOCIO1Celular1"] = ddd1_series + cel1_series
-        else:
-            df_standard["SOCIO1Celular1"] = ''
+        for source_col in potential_source_cols:
+            if source_col in df.columns:
+                col_data = df[source_col].astype(str).str.strip()
+                logging.debug(f"[DEBUG_MAP] Coluna '{std_col}': Tentando '{source_col}'. Conteúdo (primeiras 5): {col_data.head().tolist()}. Any non-empty: {col_data.any()}")
+                # Check if the column has any non-null/non-empty values (after stripping whitespace)
+                if col_data.any():
+                    df_processed[std_col] = df[source_col]
+                    found_valid_col = True
+                    logging.info(f"Coluna '{std_col}' mapeada de '{source_col}' com dados.")
+                    break # Pega a primeira correspondência com dados e vai para a próxima coluna padrão
+                else:
+                    logging.warning(f"Coluna '{source_col}' encontrada para '{std_col}' mas está vazia. Tentando outras opções...")
+        if not found_valid_col:
+            logging.warning(f"Nenhuma coluna válida encontrada para '{std_col}' entre as opções: {potential_source_cols}. Definindo como NaN.")
+            df_processed[std_col] = np.nan
 
-        ddd2_col = col_map.get("DDD2")
-        cel2_col = col_map.get("CELULAR2")
-        if ddd2_col and cel2_col and ddd2_col in df.columns and cel2_col in df.columns:
-            ddd2_series = pd.to_numeric(df[ddd2_col], errors='coerce').fillna(0).astype(int).astype(str)
-            cel2_series = pd.to_numeric(df[cel2_col], errors='coerce').fillna(0).astype(int).astype(str)
-            df_standard["SOCIO1Celular2"] = ddd2_series + cel2_series
-        else:
-            df_standard["SOCIO1Celular2"] = ''
-            
-        direct_mapping = {
-            "Logradouro": "Endereco", "Bairro": "BAIRRO",
-            "Cidade": "CIDADE", "UF": "UF"
-        }
-        for std_col, lemit_col in direct_mapping.items():
-            if lemit_col in col_map:
-                df_standard[std_col] = df[col_map[lemit_col]].fillna('').astype(str)
-            else:
-                df_standard[std_col] = ''
-
-        # Handle 'Numero' column specifically
-        numero_col = col_map.get("Numero")
-        if numero_col and numero_col in df.columns:
-            df_standard["Numero"] = pd.to_numeric(df[numero_col], errors='coerce').fillna(0).astype(int).astype(str)
-        else:
-            df_standard["Numero"] = ''
-
-        # Handle 'CNPJ' column specifically
-        cnpj_col = col_map.get("CPF/CNPJ")
-        if cnpj_col and cnpj_col in df.columns:
-            df_standard["CNPJ"] = pd.to_numeric(df[cnpj_col], errors='coerce').fillna(0).astype(int).astype(str)
-        else:
-            df_standard["CNPJ"] = ''
-        
-        df = df_standard
-        essential_cols = ASSERTIVA_ESSENTIAL_COLS
-        col_map = map_essential_columns(df, essential_cols)
-
-    missing = [col for col in essential_cols if col not in col_map]
-    for col in missing:
-        logging.warning(f"Coluna essencial ausente: {col}")
-
-    cols_to_select = [col_map[c] for c in essential_cols if c in col_map]
-    df_sel = df[cols_to_select].copy()
-
-    df_sel = df_sel.dropna(how='all', subset=cols_to_select)
-
-    # Aplica a limpeza e validação de números de telefone
-    for c in ["SOCIO1Celular1", "SOCIO1Celular2"]:
-        if c in col_map:
-            col = col_map[c]
-            df_sel[col] = df_sel[col].apply(_clean_phone_number)
-
-    # Remove linhas onde SOCIO1Celular1 está vazio (após a limpeza)
-    if "SOCIO1Celular1" in col_map:
-        df_sel = df_sel.dropna(subset=[col_map["SOCIO1Celular1"]])
-        # Remove duplicatas com base no SOCIO1Celular1
-        df_sel = df_sel.drop_duplicates(subset=[col_map["SOCIO1Celular1"]], keep='first')
-
-    if "CNPJ" in col_map:
-        cnpj_col = col_map["CNPJ"]
-        df_sel[cnpj_col] = df_sel[cnpj_col].astype(str).str.strip()
-        df_sel = df_sel.drop_duplicates(subset=[cnpj_col], keep='first')
-    elif all(c in col_map for c in ["Razao", "Logradouro"]):
-        df_sel = df_sel.drop_duplicates(
-            subset=[col_map["Razao"], col_map["Logradouro"]], keep='first'
-        )
-
-    text_cols = [col_map[c] for c in ["Razao", "Logradouro", "Bairro", "Cidade", "UF", "SOCIO1Nome"] if c in col_map]
-    for col in text_cols:
-        df_sel[col] = df_sel[col].fillna('').astype(str).str.strip()
+    logging.info("DataFrame após mapeamento inicial de colunas:")
+    logging.info(df_processed.head())
     
-    df_sel['Distancia'] = distancia_padrao
+    # Inicializa colunas de celular como string para evitar FutureWarnings
+    # Apenas inicializa se elas estiverem nas essential_cols
+    if "SOCIO1Celular1" in essential_cols:
+        df_processed["SOCIO1Celular1"] = ""
+    if "SOCIO1Celular2" in essential_cols:
+        df_processed["SOCIO1Celular2"] = ""
+    if "Whats" in essential_cols:
+        df_processed["Whats"] = ""
+    if "CEL" in essential_cols:
+        df_processed["CEL"] = ""
 
-    ordered_output_cols = []
-    for fixed_col_name in FIXED_OUTPUT_ORDER:
-        if fixed_col_name in col_map:
-            ordered_output_cols.append(col_map[fixed_col_name])
-        elif fixed_col_name == "SOCIO1Nome" and "SOCIO1Nome" in df_sel.columns:
-             ordered_output_cols.append("SOCIO1Nome")
+    # --- Lógica dedicada para SOCIO1Celular1 e SOCIO1Celular2 / DDD/FONE/Whats/CEL ---
 
-    df_final = df_sel[ordered_output_cols].copy()
+    # Prioriza a combinação DDD + FONE/CEL para Lemit, ou usa colunas diretas para Assertiva
+    # A lógica de detecção de estrutura foi movida para load_data, então precisamos do structure_type aqui
+    # Para simplificar, vamos assumir que se essential_cols contém DDD/FONE, é Lemit-like
+    is_lemit_like = "DDD" in essential_cols or "FONE" in essential_cols
 
-    sort_cols = []
-    if "Bairro" in col_map:
-        sort_cols.append(col_map["Bairro"])
-    if "Razao" in col_map:
-        sort_cols.append(col_map["Razao"])
+    if is_lemit_like:
+        # Tenta encontrar até 2 números de telefone válidos combinando DDD e FONE/CEL
+        for index, row in df.iterrows():
+            valid_phones = []
+            # Itera sobre as possíveis combinações de DDD e FONE/CEL
+            for i in range(8): # DDD, DDD.1, ..., DDD.7 e FONE, FONE.1, ..., FONE.7
+                ddd_col = f"DDD.{i}" if i > 0 else "DDD"
+                fone_col = f"FONE.{i}" if i > 0 else "FONE"
+                cel_col = f"CEL.{i}" if i > 0 else "CEL"
 
+                ddd_val = str(row.get(ddd_col, '')).strip()
+                fone_val = str(row.get(fone_col, '')).strip()
+                cel_val = str(row.get(cel_col, '')).strip()
+
+                logging.debug(f"[DEBUG] Linha {index}, Tentando cols: DDD={ddd_col} ({ddd_val}), FONE={fone_col} ({fone_val}), CEL={cel_col} ({cel_val})")
+
+                # Tenta combinar DDD com FONE
+                if ddd_val and fone_val:
+                    combined_phone = ddd_val + fone_val
+                    cleaned_phone = _clean_phone_number(combined_phone)
+                    logging.debug(f"[DEBUG] Combinado DDD+FONE: {combined_phone}, Limpo: {cleaned_phone}")
+                    if pd.notna(cleaned_phone):
+                        valid_phones.append(cleaned_phone)
+                
+                # Tenta combinar DDD com CEL
+                if ddd_val and cel_val:
+                    combined_phone = ddd_val + cel_val
+                    cleaned_phone = _clean_phone_number(combined_phone)
+                    logging.debug(f"[DEBUG] Combinado DDD+CEL: {combined_phone}, Limpo: {cleaned_phone}")
+                    if pd.notna(cleaned_phone):
+                        valid_phones.append(cleaned_phone)
+
+                # Se FONE ou CEL vierem sozinhos e forem válidos (já com DDD)
+                if not ddd_val and fone_val:
+                    cleaned_phone = _clean_phone_number(fone_val)
+                    logging.debug(f"[DEBUG] FONE sozinho: {fone_val}, Limpo: {cleaned_phone}")
+                    if pd.notna(cleaned_phone):
+                        valid_phones.append(cleaned_phone)
+                if not ddd_val and cel_val:
+                    cleaned_phone = _clean_phone_number(cel_val)
+                    logging.debug(f"[DEBUG] CEL sozinho: {cel_val}, Limpo: {cleaned_phone}")
+                    if pd.notna(cleaned_phone):
+                        valid_phones.append(cleaned_phone)
+
+                if len(valid_phones) >= 2: # Já encontrou 2, pode parar de procurar para esta linha
+                    break
+            
+            # Atribui os telefones encontrados
+            if len(valid_phones) > 0:
+                if "SOCIO1Celular1" in essential_cols:
+                    df_processed.at[index, "SOCIO1Celular1"] = valid_phones[0]
+                elif "Whats" in essential_cols: # Para Lemit, Whats é o principal
+                    df_processed.at[index, "Whats"] = valid_phones[0]
+
+            if len(valid_phones) > 1:
+                if "SOCIO1Celular2" in essential_cols:
+                    df_processed.at[index, "SOCIO1Celular2"] = valid_phones[1]
+                elif "CEL" in essential_cols: # Para Lemit, CEL é o secundário
+                    df_processed.at[index, "CEL"] = valid_phones[1]
+
+    else: # Estrutura Assertiva ou desconhecida, usa as colunas diretas
+        for index, row in df.iterrows():
+            if "SOCIO1Celular1" in essential_cols:
+                s1_cel1 = row.get("SOCIO1Celular1", np.nan)
+                df_processed.at[index, "SOCIO1Celular1"] = _clean_phone_number(s1_cel1)
+            
+            if "SOCIO1Celular2" in essential_cols:
+                s1_cel2 = row.get("SOCIO1Celular2", np.nan)
+                df_processed.at[index, "SOCIO1Celular2"] = _clean_phone_number(s1_cel2)
+
+    logging.info("DataFrame após tratamento de telefones dedicados:")
+    logging.info(df_processed.head())
+
+    # --- Aplica a formatação final dos números de celular ---
+    if "SOCIO1Celular1" in essential_cols:
+        df_processed["SOCIO1Celular1"] = df_processed["SOCIO1Celular1"].apply(lambda x: _format_phone_with_ddd(x, include_country_code=True))
+    if "SOCIO1Celular2" in essential_cols:
+        df_processed["SOCIO1Celular2"] = df_processed["SOCIO1Celular2"].apply(lambda x: _format_phone_with_ddd(x, include_country_code=False))
+    if "Whats" in essential_cols:
+        df_processed["Whats"] = df_processed["Whats"].apply(lambda x: _format_phone_with_ddd(x, include_country_code=True))
+    if "CEL" in essential_cols:
+        df_processed["CEL"] = df_processed["CEL"].apply(lambda x: _format_phone_with_ddd(x, include_country_code=False))
+
+    logging.info("DataFrame após formatação final dos celulares:")
+    logging.info(df_processed.head())
+
+    # --- Lógica de Fallback para Sócios (apenas para Assertiva-like) ---
+    # Se as colunas de sócio estiverem nas essential_cols, aplica a lógica de fallback
+    if "SOCIO1Nome" in essential_cols:
+        SOCIO_FIELDS = [
+            ("Nome", "SOCIO1Nome", "SOCIO2Nome"),
+            ("Celular1", "SOCIO1Celular1", "SOCIO2Celular1"),
+            ("Celular2", "SOCIO1Celular2", "SOCIO2Celular2"),
+            ("CPF", "SOCIO1CPF", "SOCIO2CPF")
+        ]
+
+        def _is_field_valid(field_name, value):
+            if pd.isna(value) or str(value).strip() == "":
+                return False
+            if field_name == "CPF":
+                return _is_valid_cpf(str(value))
+            return True
+
+        rows_to_drop = []
+        for index, row in df_processed.iterrows():
+            socio1_has_any_valid_data = False
+            
+            for field_name, s1_col, s2_col in SOCIO_FIELDS:
+                s1_val = row.get(s1_col, np.nan)
+                s2_val = row.get(s2_col, np.nan)
+
+                s1_valid = _is_field_valid(field_name, s1_val)
+                s2_valid = _is_field_valid(field_name, s2_val)
+
+                if not s1_valid:
+                    if s2_valid:
+                        df_processed.at[index, s1_col] = s2_val
+                        logging.info(f"[FALLBACK] {s1_col} inválido para linha {index}. Usando {s2_col} ({s2_val}).")
+                        socio1_has_any_valid_data = True
+                    else:
+                        df_processed.at[index, s1_col] = np.nan # Marcar como NaN se nenhum for válido
+                        logging.warning(f"[FALLBACK] {s1_col} e {s2_col} inválidos/ausentes para linha {index}. Definido {s1_col} como NaN.")
+                else:
+                    socio1_has_any_valid_data = True
+            
+            # After checking all fields, decide if the row should be dropped
+            if not socio1_has_any_valid_data:
+                logging.error(f"[ERRO] Nenhum sócio com dados válidos encontrado para linha {index} após fallbacks. Marcando para remoção.")
+                rows_to_drop.append(index)
+        
+        if rows_to_drop:
+            df_processed.drop(rows_to_drop, inplace=True)
+            logging.info(f"Removidas {len(rows_to_drop)} linhas sem sócios válidos após fallbacks.")
+
+        # Remover colunas SOCIO2* após o fallback
+        cols_to_drop_socio2 = [col for col in df_processed.columns if col.startswith("SOCIO2")]
+        if cols_to_drop_socio2:
+            df_processed.drop(columns=cols_to_drop_socio2, inplace=True)
+            logging.info(f"Colunas SOCIO2 removidas: {cols_to_drop_socio2}")
+
+        logging.info("DataFrame após tratamento de telefone e fallback de sócios:")
+        logging.info(df_processed.head())
+
+    # --- Bloco de Limpeza e Seleção (Unificado) ---
+    
+    # Garante que todas as colunas essenciais existam
+    for col in essential_cols:
+        if col not in df_processed.columns:
+            df_processed[col] = ""
+
+    # Remove duplicatas com base na prioridade
+    if "CNPJ" in df_processed.columns and bool(df_processed["CNPJ"].notna().any()):
+        df_processed.drop_duplicates(subset=["CNPJ"], keep='first', inplace=True)
+    elif "SOCIO1Celular1" in df_processed.columns and bool(df_processed["SOCIO1Celular1"].notna().any()):
+        df_processed.drop_duplicates(subset=["SOCIO1Celular1"], keep='first', inplace=True)
+    elif "Whats" in df_processed.columns and bool(df_processed["Whats"].notna().any()):
+        df_processed.drop_duplicates(subset=["Whats"], keep='first', inplace=True)
+    elif "Razao" in df_processed.columns and "Logradouro" in df_processed.columns:
+        df_processed.drop_duplicates(subset=["Razao", "Logradouro"], keep='first', inplace=True)
+
+    # Limpeza final das colunas de texto
+    for col in ["Razao", "Logradouro", "Bairro", "Cidade", "UF", "SOCIO1Nome", "NOME", "Whats", "CEL"]:
+        if col in df_processed.columns:
+            df_processed[col] = df_processed[col].fillna('').astype(str).str.strip()
+
+    # Seleciona e ordena as colunas para a saída final
+    final_cols = [col for col in FIXED_OUTPUT_ORDER if col in df_processed.columns]
+    df_final = df_processed[final_cols].copy()
+
+    # Ordena o resultado final
+    sort_cols = [col for col in ["Bairro", "Razao"] if col in df_final.columns]
     if sort_cols:
-        df_final = df_final.sort_values(by=sort_cols, ascending=True)
+        df_final.sort_values(by=sort_cols, ascending=True, inplace=True)
 
-    return df_final.reset_index(drop=True), missing, structure
+    missing = [col for col in essential_cols if col not in df_processed.columns]
+    logging.info("DataFrame final antes de retornar:")
+    logging.info(df_final.head())
+
+    print(f"DEBUG: clean_and_filter_data final return: df_final shape: {df_final.shape if not df_final.empty else 'empty'}, missing: {missing}, structure: {'Structure_Type_Placeholder'}")
+    return df_final.reset_index(drop=True), missing, "Structure_Type_Placeholder" # Retorna 3 valores
